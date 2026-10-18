@@ -90,6 +90,45 @@ class ClassifyTest(unittest.TestCase):
         self.assertIsNone(verify.load_errors(listed, "q@m"))
         self.assertIsNone(verify.load_errors("not json", "p@cpd-p"))
 
+    def test_load_outcome_follows_c25_error_types(self):
+        # Recorded `plugin list --json` records (claudepluginhub cli-oracle c25, Claude Code 2.1.302).
+        whole = {"id": "h@m", "errors": ["hooks.json declares PreToolUse/PermissionRequest at its top level"],
+                 "errorDetails": [{"type": "generic-error", "plugin": "h"}]}
+        hook = {"id": "h@m", "errors": ["Hook load failed: [...]"],
+                "errorDetails": [{"type": "hook-load-failed", "plugin": "h", "path": "/x/hooks/hooks.json"}]}
+        path = {"id": "h@m", "errors": ["Path not found: /x/agents (agents)"],
+                "errorDetails": [{"type": "path-not-found", "plugin": "h", "path": "/x/agents"}]}
+        mixed = {**hook, "errorDetails": hook["errorDetails"] + whole["errorDetails"]}
+        unplaced = {**hook, "errorDetails": [{"type": "something-new", "plugin": "h"}]}
+        legacy = {"id": "h@m", "errors": ["Hook load failed"]}
+        for record, outcome in (
+            ({"id": "h@m", "errors": []}, "installed"),
+            (whole, "load_refused"),
+            (hook, "load_warnings"),
+            (path, "load_warnings"),
+            (mixed, "load_refused"),
+            (unplaced, "load_errors"),
+            (legacy, "load_errors"),
+        ):
+            self.assertEqual(verify.load_outcome(json.dumps([record]), "h@m"), outcome, record)
+
+    def test_installed_ref_from_the_cli_record(self):
+        sha = "c494ecef09253c615807669e7b28fb9723bc3c61"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertIsNone(verify.installed_ref(root, "p@m"))  # no file: a failed install
+            (root / "cfg" / "plugins").mkdir(parents=True)
+            record = root / "cfg" / "plugins" / "installed_plugins.json"
+            record.write_text(json.dumps({"plugins": {"p@m": [{"version": "1.2.3", "gitCommitSha": sha}],
+                                                      "l@m": [{"version": "1.0.0", "gitCommitSha": None}],
+                                                      "x@m": [{"gitCommitSha": "main"}]}}))
+            self.assertEqual(verify.installed_ref(root, "p@m"), sha)
+            self.assertIsNone(verify.installed_ref(root, "l@m"))  # not a git clone (c10)
+            self.assertIsNone(verify.installed_ref(root, "x@m"))  # not a full commit
+            self.assertIsNone(verify.installed_ref(root, "q@m"))
+            record.write_text("not json")
+            self.assertIsNone(verify.installed_ref(root, "p@m"))
+
     def test_mcp_servers_of_the_installed_plugin(self):
         listed = json.dumps([{"id": "p@m", "mcpServers": {"web": {"command": "node"}, "db": {"command": "x"}}}])
         self.assertEqual(verify.mcp_servers(listed, "p@m"), ["db", "web"])

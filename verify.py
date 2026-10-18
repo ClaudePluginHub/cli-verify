@@ -3,7 +3,8 @@
 
 Three steps, one per workflow job:
   plan    targets.json (from claudepluginhub.com/api/cli-checks/targets) -> plan.json: per OS, the
-          targets whose commit, route or CLI version changed since their stored result.
+          targets whose check key (commit, marketplace entry, route) or CLI version changed since
+          their stored result.
   check   plan.json -> results-<os>.json: install each planned target in a throwaway HOME and
           CLAUDE_CONFIG_DIR, 8 at a time. Runs third-party code paths; the job holds no secrets.
   report  results-*.json -> report.json, the body POSTed to /api/cli-checks/results.
@@ -176,6 +177,35 @@ def load_errors(list_stdout: str, install_arg: str) -> list[str] | None:
     return None if record is None else [str(e) for e in record.get("errors") or []]
 
 
+# `errorDetails[].type` values that leave the rest of the plugin loaded (claudepluginhub c25, c32).
+# `generic-error` is the one where Claude Code loads none of it (`plugin details` says "not found").
+PARTIAL_LOAD_TYPES = {"hook-load-failed", "path-not-found", "component-load-failed"}
+
+
+def load_outcome(list_stdout: str, install_arg: str) -> str:
+    """installed, load_refused (loads none of it), load_warnings (loads it, drops a part) or
+    load_errors (errors of a type c25 hasn't placed: the site treats it as unknown)."""
+    record = list_record(list_stdout, install_arg) or {}
+    if not record.get("errors"):
+        return "installed"
+    details = record.get("errorDetails")
+    types = {d.get("type") for d in details if isinstance(d, dict)} if isinstance(details, list) else set()
+    if "generic-error" in types:
+        return "load_refused"
+    return "load_warnings" if types and types <= PARTIAL_LOAD_TYPES else "load_errors"
+
+
+def installed_ref(root: Path, install_arg: str) -> str | None:
+    """The commit Claude Code recorded for the install (installed_plugins.json, claudepluginhub c10).
+    None for a source that isn't a git clone, or when the file doesn't say."""
+    try:
+        data = json.loads((root / "cfg" / "plugins" / "installed_plugins.json").read_text(encoding="utf-8"))
+        sha = data["plugins"][install_arg][0].get("gitCommitSha")
+    except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return None
+    return sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else None
+
+
 def mcp_servers(list_stdout: str, install_arg: str) -> list[str]:
     """Names of the MCP servers Claude Code's loader kept for the plugin."""
     servers = (list_record(list_stdout, install_arg) or {}).get("mcpServers")
@@ -224,7 +254,7 @@ def check_one(claude: str, target: dict, os_name: str) -> dict:
             raise
         return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
-    def done(outcome: str, message: str | None, **listed: list[str]) -> dict:
+    def done(outcome: str, message: str | None, **listed: object) -> dict:
         return {
             "pluginId": target["pluginId"],
             "os": os_name,
@@ -255,8 +285,9 @@ def check_one(claude: str, target: dict, os_name: str) -> dict:
         extra = {
             "loadErrors": [normalize(e, root) for e in errors],
             "mcpServers": mcp_servers(listed.stdout, target["installArg"]),
+            "installedRef": installed_ref(root, target["installArg"]),
         }
-        return done("load_errors", "\n".join(errors), **extra) if errors else done("installed", None, **extra)
+        return done(load_outcome(listed.stdout, target["installArg"]), "\n".join(errors) or None, **extra)
     except subprocess.TimeoutExpired:
         return done("error", f"timed out after {TIMEOUT_S} s")
     except Exception as error:  # noqa: BLE001 — one bad target must not take the OS's batch with it
