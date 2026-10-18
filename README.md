@@ -9,8 +9,14 @@ itself has confirmed the refusal.
   and `claude plugin list --json`, each plugin in its own throwaway `HOME` and `CLAUDE_CONFIG_DIR`.
   No Claude session, no `-p`, no `claude mcp`. stdin is never a terminal, so Claude Code never runs a
   marketplace entry's `command` source.
-- **When:** hourly (`.github/workflows/verify.yml`). A plugin is checked again only when its commit,
-  its install route or the Claude Code version changes.
+- **What it reports:** per plugin and OS, the outcome (`installed`, `load_warnings` when Claude Code
+  loads the plugin but drops a part, `load_refused` when it loads none of it, `load_errors` for an
+  error type not yet placed, or a refusal at add or install), the CLI's message, and `installedRef`,
+  the commit Claude Code recorded in `installed_plugins.json` (null when it records none). The
+  load split follows `plugin list --json` `errorDetails[].type` (claudepluginhub cli-oracle c25:
+  `generic-error` means nothing loads).
+- **When:** hourly (`.github/workflows/verify.yml`). A plugin is checked again only when its
+  commit, its marketplace entry, its install route or the Claude Code version changes.
 - **Isolation:** the check jobs hold no secrets, no write permissions and no caches. Only the report
   job, which runs no plugin code, holds the secret that posts results to claudepluginhub.com.
 
