@@ -76,7 +76,9 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    # A new Claude Code version re-checks every target; Windows takes longest. Results are saved as
+    # they land, so a job that runs out of time still reports what it finished.
+    timeout-minutes: 120
     permissions:
       contents: read
     defaults:
@@ -114,6 +116,7 @@ jobs:
       - name: Install every planned plugin
         run: ${{ matrix.py }} verify.py check --plan plan.json --os ${{ matrix.os }} --out results-${{ matrix.os }}.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
         with:
           name: results-${{ matrix.os }}
           path: results-${{ matrix.os }}.json

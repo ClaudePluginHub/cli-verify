@@ -10,8 +10,8 @@ import verify  # noqa: E402
 
 # Recorded Claude Code 2.1.302 output (claudepluginhub cli-oracle c28 and the 2026-10-17 probes).
 REFUSED = (
-    '{"command":"install","outcome":"failed","plugin":"p@cpd-p","scope":"user","message":"Plugin temp_github_1 has an '
-    'invalid manifest file at /tmp/cliv-x/cfg/plugins/cache/temp_github_1/.claude-plugin/plugin.json.\\n\\nValidation '
+    '{"command":"install","outcome":"failed","plugin":"p@cpd-p","scope":"user","message":"Plugin temp_github_1792291888483_qr227e has an '
+    'invalid manifest file at /tmp/cliv-x/cfg/plugins/cache/temp_github_1792291888483_qr227e/.claude-plugin/plugin.json.\\n\\nValidation '
     'errors: author: Invalid input: expected object, received string","failureCode":"error_validation"}'
 )
 COMMAND_SOURCE = (
@@ -90,11 +90,18 @@ class ClassifyTest(unittest.TestCase):
         self.assertIsNone(verify.load_errors(listed, "q@m"))
         self.assertIsNone(verify.load_errors("not json", "p@cpd-p"))
 
+    def test_mcp_servers_of_the_installed_plugin(self):
+        listed = json.dumps([{"id": "p@m", "mcpServers": {"web": {"command": "node"}, "db": {"command": "x"}}}])
+        self.assertEqual(verify.mcp_servers(listed, "p@m"), ["db", "web"])
+        self.assertEqual(verify.mcp_servers(json.dumps([{"id": "p@m"}]), "p@m"), [])
+
     def test_normalize_shows_paths_as_the_users_own(self):
         root = Path("/tmp/cliv-x")
         message = verify.parse_install(REFUSED)["message"]
-        self.assertIn("~/.claude/plugins/cache/temp_github_1/.claude-plugin/plugin.json", verify.normalize(message, root))
+        self.assertIn("~/.claude/plugins/cache/temp_github_…/.claude-plugin/plugin.json", verify.normalize(message, root))
         self.assertNotIn("/tmp/cliv-x", verify.normalize(message, root))
+        # The random clone-folder name is dropped, so the same refusal reads the same everywhere.
+        self.assertIn("Plugin temp_github_… has an invalid manifest", verify.normalize(message, root))
         self.assertEqual(len(verify.normalize("x" * 5000, root)), verify.MESSAGE_MAX)
 
     def test_normalize_resolved_paths_whole(self):

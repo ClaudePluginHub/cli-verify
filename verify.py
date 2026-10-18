@@ -33,6 +33,10 @@ from pathlib import Path
 OSES = ("linux", "macos", "windows")
 TIMEOUT_S = 120
 MESSAGE_MAX = 2000
+# The CLI clones into a randomly named folder (`temp_github_1792291888483_qr227e`). Without the random
+# part, the same refusal reads the same on every OS and run. Paths are otherwise left as they are: a
+# backslash may be the defect.
+TEMP_NAME_RE = re.compile(r"\b(temp_[a-z]+)_\d{10,}_[a-z0-9]+\b")
 
 # A failure that says nothing about the plugin: retried next run, never reported as a refusal.
 # Phrases only: the text echoes repo and plugin names, so a bare word like "tls" would turn a
@@ -118,7 +122,7 @@ def normalize(text: str, root: Path) -> str:
         forms = {str(base), str(base).replace("\\", "/"), str(base.resolve())}
         for form in sorted(forms, key=len, reverse=True):
             text = text.replace(form, shown)
-    text = text.strip()
+    text = TEMP_NAME_RE.sub(r"\1_…", text).strip()
     return text if len(text) <= MESSAGE_MAX else text[: MESSAGE_MAX - 1] + "…"
 
 
@@ -154,16 +158,28 @@ def classify_install(result: dict | None, output: str) -> str:
     return "install_refused"
 
 
-def load_errors(list_stdout: str, install_arg: str) -> list[str] | None:
-    """The installed plugin's load errors, or None when `plugin list` doesn't show it."""
+def list_record(list_stdout: str, install_arg: str) -> dict | None:
+    """The installed plugin's `plugin list --json` record, or None when it doesn't show it."""
     try:
         records = json.loads(list_stdout)
     except json.JSONDecodeError:
         return None
     for record in records if isinstance(records, list) else []:
         if isinstance(record, dict) and record.get("id") == install_arg:
-            return [str(e) for e in record.get("errors") or []]
+            return record
     return None
+
+
+def load_errors(list_stdout: str, install_arg: str) -> list[str] | None:
+    """The installed plugin's load errors, or None when `plugin list` doesn't show it."""
+    record = list_record(list_stdout, install_arg)
+    return None if record is None else [str(e) for e in record.get("errors") or []]
+
+
+def mcp_servers(list_stdout: str, install_arg: str) -> list[str]:
+    """Names of the MCP servers Claude Code's loader kept for the plugin."""
+    servers = (list_record(list_stdout, install_arg) or {}).get("mcpServers")
+    return sorted(servers) if isinstance(servers, dict) else []
 
 
 def kill_tree(proc: subprocess.Popen) -> None:
@@ -208,7 +224,7 @@ def check_one(claude: str, target: dict, os_name: str) -> dict:
             raise
         return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
-    def done(outcome: str, message: str | None) -> dict:
+    def done(outcome: str, message: str | None, **listed: list[str]) -> dict:
         return {
             "pluginId": target["pluginId"],
             "os": os_name,
@@ -217,6 +233,7 @@ def check_one(claude: str, target: dict, os_name: str) -> dict:
             "message": normalize(message, root) if message else None,
             "checkedAt": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
             "durationMs": int((time.monotonic() - started) * 1000),
+            **listed,
         }
 
     try:
@@ -234,7 +251,12 @@ def check_one(claude: str, target: dict, os_name: str) -> dict:
         errors = load_errors(listed.stdout, target["installArg"]) if listed.returncode == 0 else None
         if errors is None:
             return done("error", "plugin list did not show the installed plugin\n" + listed.stdout + listed.stderr)
-        return done("load_errors", "\n".join(errors)) if errors else done("installed", None)
+        # What the site compares with the page's load warnings and MCP servers (Linux).
+        extra = {
+            "loadErrors": [normalize(e, root) for e in errors],
+            "mcpServers": mcp_servers(listed.stdout, target["installArg"]),
+        }
+        return done("load_errors", "\n".join(errors), **extra) if errors else done("installed", None, **extra)
     except subprocess.TimeoutExpired:
         return done("error", f"timed out after {TIMEOUT_S} s")
     except Exception as error:  # noqa: BLE001 — one bad target must not take the OS's batch with it
@@ -243,13 +265,22 @@ def check_one(claude: str, target: dict, os_name: str) -> dict:
         shutil.rmtree(root, ignore_errors=True)
 
 
-def check(plan_data: dict, os_name: str, concurrency: int) -> list[dict]:
+def check(plan_data: dict, os_name: str, concurrency: int, out: Path) -> list[dict]:
+    """Installs every planned target; `out` is rewritten as results land, so a job that hits its
+    time limit still uploads what it finished (the rest is planned again next run)."""
     claude = shutil.which("claude")
     if not claude:
         raise SystemExit("claude is not on PATH")
     work = plan_data["work"][os_name]
+    results: list[dict] = []
+    out.write_text("[]")
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-        results = list(pool.map(lambda t: check_one(claude, t, os_name), work))
+        futures = [pool.submit(check_one, claude, t, os_name) for t in work]
+        for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
+            results.append(future.result())
+            if i % 10 == 0 or i == len(futures):
+                out.write_text(json.dumps(results))
+                print(f"{os_name}: {i}/{len(futures)}", file=sys.stderr, flush=True)
     counts: dict[str, int] = {}
     for r in results:
         counts[r["outcome"]] = counts.get(r["outcome"], 0) + 1
@@ -297,7 +328,7 @@ def main() -> None:
         oses = [o for o in OSES if data["work"][o]]
         print(json.dumps({"os": oses, "counts": {o: len(data["work"][o]) for o in OSES}}))
     elif args.step == "check":
-        args.out.write_text(json.dumps(check(json.loads(args.plan.read_text()), args.os, args.concurrency)))
+        check(json.loads(args.plan.read_text()), args.os, args.concurrency, args.out)
     else:
         args.out.write_text(json.dumps(report(args.results, args.run_id, args.run_url, args.cli_version)))
 
