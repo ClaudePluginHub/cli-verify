@@ -1,0 +1,155 @@
+name: Verify with Claude Code
+
+# Installs ClaudePluginHub's owned and top plugins with the real Claude Code CLI on Linux, macOS and
+# Windows, and reports what it did to claudepluginhub.com. Hourly; a plugin is re-checked only when
+# its commit, its install route or the Claude Code version changed (see verify.py plan).
+#
+# Trust model: the check jobs install third-party plugins, so they get no secrets, no write
+# permissions and no caches. Only the report job, which runs no plugin code, holds the ingest secret.
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      slugs:
+        description: Comma-separated plugin slugs to check on every OS (default = what changed)
+        required: false
+        default: ''
+      force:
+        description: Re-check every target
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: cli-verify
+  cancel-in-progress: false
+
+env:
+  SITE: https://www.claudepluginhub.com
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      cli: ${{ steps.plan.outputs.cli }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Latest Claude Code version
+        run: |
+          curl -fsSL https://claude.ai/install.sh -o install-claude.sh
+          bash install-claude.sh latest
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Plan
+        id: plan
+        env:
+          SLUGS: ${{ inputs.slugs }}
+          FORCE: ${{ inputs.force && '--force' || '' }}
+        run: |
+          set -euo pipefail
+          cli=$(claude --version | awk '{print $1}')
+          [[ "$cli" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::unreadable version '$cli'"; exit 1; }
+          curl -fsS --retry 3 "$SITE/api/cli-checks/targets" -o targets.json
+          python3 verify.py plan --targets targets.json --cli-version "$cli" --slugs "$SLUGS" $FORCE --out plan.json | tee plan-summary.json
+          matrix=$(python3 -c 'import json; s=json.load(open("plan-summary.json")); r={"linux":["ubuntu-latest","python3"],"macos":["macos-latest","python3"],"windows":["windows-latest","python"]}; print(json.dumps({"include":[{"os":o,"runner":r[o][0],"py":r[o][1]} for o in s["os"]]}, separators=(",",":")))')
+          echo "cli=$cli" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "Claude Code $cli: $(cat plan-summary.json)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan
+          path: plan.json
+          retention-days: 7
+
+  check:
+    needs: plan
+    if: needs.plan.outputs.matrix != '{"include":[]}'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan
+      - name: Install Claude Code ${{ needs.plan.outputs.cli }} (Linux, macOS)
+        if: matrix.os != 'windows'
+        env:
+          CLI: ${{ needs.plan.outputs.cli }}
+        run: |
+          curl -fsSL https://claude.ai/install.sh -o install-claude.sh
+          bash install-claude.sh "$CLI"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install Claude Code ${{ needs.plan.outputs.cli }} (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          CLI: ${{ needs.plan.outputs.cli }}
+        run: |
+          & ([scriptblock]::Create((irm https://claude.ai/install.ps1))) $env:CLI
+          "$env:USERPROFILE\.local\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: What this OS tests
+        run: |
+          claude --version
+          git --version
+          echo "core.symlinks=$(git config --get core.symlinks || echo unset) core.longpaths=$(git config --get core.longpaths || echo unset) core.ignorecase=$(git config --get core.ignorecase || echo unset)"
+          d=$(mktemp -d); touch "$d/a" "$d/A"; echo "case-sensitive filesystem: $([ "$(ls "$d" | wc -l)" -eq 2 ] && echo yes || echo no)"
+      - name: Install every planned plugin
+        run: ${{ matrix.py }} verify.py check --plan plan.json --os ${{ matrix.os }} --out results-${{ matrix.os }}.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-${{ matrix.os }}
+          path: results-${{ matrix.os }}.json
+          retention-days: 30
+
+  report:
+    needs: [plan, check]
+    # Also when nothing was planned or an OS failed: the report is the heartbeat, and partial results still count.
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The ingest secret lives in this environment, which only runs from main.
+    environment: ingest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: results-*
+          merge-multiple: true
+          path: results
+      - name: Build the report
+        env:
+          CLI: ${{ needs.plan.outputs.cli }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          shopt -s nullglob
+          python3 verify.py report results/results-*.json --run-id "$GITHUB_RUN_ID" --run-url "$RUN_URL" --cli-version "$CLI" --out report.json
+          python3 -c 'import json,collections; r=json.load(open("report.json"))["results"]; print(collections.Counter((x["os"],x["outcome"]) for x in r))' >> "$GITHUB_STEP_SUMMARY"
+      - name: Send to claudepluginhub.com
+        env:
+          CLI_CHECK_INGEST_SECRET: ${{ secrets.CLI_CHECK_INGEST_SECRET }}
+        run: |
+          curl -fsS --retry 3 --retry-all-errors -X POST "$SITE/api/cli-checks/results" \
+            -H "Authorization: Bearer $CLI_CHECK_INGEST_SECRET" -H 'content-type: application/json' \
+            --data-binary @report.json
