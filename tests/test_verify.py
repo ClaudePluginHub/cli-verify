@@ -200,5 +200,70 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(len(verify.plan([t], "2.1.302", slugs={"zzz"})["work"]["windows"]), 0)
 
 
+class ReportTest(unittest.TestCase):
+    """A check job's results file is untrusted: only what the plan asked of that OS is reported."""
+
+    plan = {
+        "cliVersion": "2.1.302",
+        "work": {
+            "linux": [{"pluginId": "p1", "checkKey": "k1"}, {"pluginId": "p2", "checkKey": "k2"}],
+            "macos": [],
+            "windows": [{"pluginId": "p1", "checkKey": "k1"}],
+        },
+    }
+
+    def result(self, plugin_id, os_name, key, outcome="installed"):
+        return {"pluginId": plugin_id, "os": os_name, "checkKey": key, "outcome": outcome}
+
+    def build(self, files):
+        with tempfile.TemporaryDirectory() as d:
+            for os_name, content in files.items():
+                folder = Path(d) / f"results-{os_name}"
+                folder.mkdir()
+                (folder / f"results-{os_name}.json").write_text(json.dumps(content))
+            body, dropped = verify.report(Path(d), self.plan, 1, "https://github.com/o/r/actions/runs/1", "2.1.302")
+        return [(r["pluginId"], r["os"]) for r in body["results"]], dropped
+
+    def test_keeps_a_planned_result(self):
+        accepted, dropped = self.build({"linux": [self.result("p1", "linux", "k1")]})
+        self.assertEqual(accepted, [("p1", "linux")])
+        self.assertEqual(dropped, {})
+
+    def test_drops_forged_results(self):
+        accepted, dropped = self.build(
+            {
+                "linux": [
+                    self.result("p1", "linux", "k1"),
+                    self.result("p9", "linux", "k9"),  # not planned at all
+                    self.result("p2", "linux", "stale"),  # planned plugin, other key
+                    self.result("p1", "windows", "k1"),  # another OS's result from the Linux job
+                    self.result("p2", "linux", "k2"),
+                    self.result("p2", "linux", "k2", "install_refused"),  # duplicate: both go
+                ],
+                "macos": [self.result("p1", "macos", "k1")],  # nothing planned on macOS
+                "windows": [self.result("p1", "windows", "k1")],
+            }
+        )
+        self.assertEqual(accepted, [("p1", "linux"), ("p1", "windows")])
+        self.assertEqual(dropped, {"not planned": 3, "wrong os": 1, "duplicate": 2})
+
+    def test_drops_non_string_ids_and_keys(self):
+        accepted, dropped = self.build(
+            {
+                "linux": [
+                    {"pluginId": ["p1"], "os": "linux", "checkKey": "k1"},
+                    {"pluginId": "p1", "os": "linux", "checkKey": {"k": 1}},
+                    {"os": "linux", "checkKey": "k1"},
+                    self.result("p2", "linux", "k2"),
+                ]
+            }
+        )
+        self.assertEqual((accepted, dropped), ([("p2", "linux")], {"bad id or key": 3}))
+
+    def test_drops_a_file_that_is_not_a_list(self):
+        accepted, dropped = self.build({"linux": {"pluginId": "p1"}})
+        self.assertEqual((accepted, dropped), ([], {"not a list": 1}))
+
+
 if __name__ == "__main__":
     unittest.main()
