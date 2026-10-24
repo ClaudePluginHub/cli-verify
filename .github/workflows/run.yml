@@ -188,7 +188,7 @@ jobs:
           echo "$PLAN_SHA256  plan/plan.json" | sha256sum -c --quiet || { echo "::error::plan artifact differs from what the plan job wrote"; exit 1; }
           # Only (plugin, OS, key) the plan asked for, one per plugin and OS; the rest is dropped and counted.
           python3 verify.py report --results-dir results --plan plan/plan.json --run-id "$GITHUB_RUN_ID" --run-url "$RUN_URL" --cli-version "$CLI" \
-            --lane "$LANE" --run-started-at "$STARTED_AT" --requested-at "$REQUESTED_AT" --out report.json | tee -a "$GITHUB_STEP_SUMMARY"
+            --lane "$LANE" --run-started-at="$STARTED_AT" --requested-at="$REQUESTED_AT" --out report.json | tee -a "$GITHUB_STEP_SUMMARY"
           python3 -c 'import json,collections; r=json.load(open("report.json"))["results"]; print(collections.Counter((x["os"],x["outcome"]) for x in r))' >> "$GITHUB_STEP_SUMMARY"
       - name: Send to claudepluginhub.com
         env:

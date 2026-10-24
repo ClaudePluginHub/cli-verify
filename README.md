@@ -27,9 +27,9 @@ itself has confirmed the refusal.
     carries no plugin list: GitHub keeps one pending run per group and replaces it, so the plan is
     recomputed from the live targets.
 - **Retry:** a result other than `installed` or `error` is checked once more, from scratch, in a fresh
-  `HOME` and `CLAUDE_CONFIG_DIR`. The same outcome and message (temp paths normalized) stands;
-  anything else is reported as `error` with a message starting `flaky: attempts disagreed: `, so no
-  owner alert rests on one attempt. Network failures (`TRANSIENT_RE`) are `error` as before.
+  `HOME` and `CLAUDE_CONFIG_DIR`. The same outcome stands, with the first attempt's message; a
+  different outcome is reported as `error` with a message starting `flaky: attempts disagreed: `, so
+  no owner alert rests on one attempt. Network failures (`TRANSIENT_RE`) are `error` as before.
 - **Report body:** `{runId, runUrl, cliVersion, lane, runStartedAt, requestedAt, results}`. `lane`
   is `"full"` or `"fast"`, `runStartedAt` is when the plan job started (`…Z`), `requestedAt` is the
   fast lane's `requested_at` normalized to UTC `…Z`, or `null` (full lane, or missing/unreadable).

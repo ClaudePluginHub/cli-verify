@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -186,15 +187,16 @@ class RetryTest(unittest.TestCase):
         self.assertEqual((result["outcome"], result["message"], calls), ("install_refused", "bad manifest", 2))
         self.assertEqual(result["durationMs"], 200)
         self.assertEqual(result["loadErrors"], [])
+        # Same outcome, other words (a path normalization missed): the first attempt's result stands.
+        result, _ = self.run_with(("load_warnings", "Path not found: /tmp/a"), ("load_warnings", "Path not found: /tmp/b"))
+        self.assertEqual((result["outcome"], result["message"]), ("load_warnings", "Path not found: /tmp/a"))
 
     def test_disagreeing_attempts_are_an_error(self):
         result, calls = self.run_with(("install_refused", "bad manifest"), ("installed", None))
         self.assertEqual((result["outcome"], calls), ("error", 2))
         self.assertTrue(result["message"].startswith("flaky: attempts disagreed: install_refused then installed"))
         self.assertNotIn("loadErrors", result)
-        # Same outcome, other words: also flaky.
-        result, _ = self.run_with(("load_warnings", "Path not found: a"), ("load_warnings", "Path not found: b"))
-        self.assertTrue(result["message"].startswith("flaky: attempts disagreed: load_warnings then load_warnings"))
+        self.assertIn("1: bad manifest", result["message"])
         # A transient failure on the second attempt is not confirmation.
         result, _ = self.run_with(("add_refused", "bad name"), ("error", "Could not resolve host"))
         self.assertEqual(result["outcome"], "error")
@@ -330,6 +332,24 @@ class ReportTest(unittest.TestCase):
             self.assertIsNone(body["requestedAt"])
             body, _ = verify.report(Path(d), self.plan, 1, "u", "2.1.302", "fast", "", "not a date")
             self.assertEqual((body["runStartedAt"], body["requestedAt"]), (None, None))
+            # Shifting year 1 or 9999 to UTC overflows: unreadable, not a crash.
+            for edge in ("0001-01-01T00:00:00+05:00", "9999-12-31T23:59:59-05:00"):
+                body, _ = verify.report(Path(d), self.plan, 1, "u", "2.1.302", "fast", "", edge)
+                self.assertIsNone(body["requestedAt"], edge)
+
+    def test_cli_takes_a_requested_at_that_looks_like_a_flag(self):
+        # The workflow passes --requested-at=<input>: a dispatch input of "-x" must not end the report.
+        with tempfile.TemporaryDirectory() as d:
+            plan_path, out = Path(d) / "plan.json", Path(d) / "report.json"
+            plan_path.write_text(json.dumps(self.plan))
+            subprocess.run(
+                [sys.executable, str(Path(verify.__file__)), "report", "--results-dir", d, "--plan", str(plan_path),
+                 "--run-id", "1", "--run-url", "u", "--cli-version", "2.1.302", "--lane", "fast",
+                 "--run-started-at=2026-10-24T10:00:05Z", "--requested-at=-x", "--out", str(out)],
+                check=True, capture_output=True,
+            )
+            body = json.loads(out.read_text())
+            self.assertEqual((body["requestedAt"], body["runStartedAt"]), (None, "2026-10-24T10:00:05Z"))
 
     def test_drops_a_file_that_is_not_a_list(self):
         accepted, dropped = self.build({"linux": {"pluginId": "p1"}})

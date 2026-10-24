@@ -314,14 +314,16 @@ NO_RETRY = {"installed", "error"}
 
 def check_one(claude: str, target: dict, os_name: str) -> dict:
     """A refusal or load problem is what owners get alerted on, so it must repeat: the whole check
-    runs once more in a fresh HOME and CLAUDE_CONFIG_DIR. The same outcome and message (temp paths
-    are normalized away) stands; anything else is reported as `error`, which the hourly run retries."""
+    runs once more in a fresh HOME and CLAUDE_CONFIG_DIR. The same outcome stands (with the first
+    attempt's message: wording that differs, e.g. a path normalization misses, must not turn a
+    deterministic refusal into an error); a different one is reported as `error`, which the hourly
+    run retries."""
     first = check_attempt(claude, target, os_name)
     if first["outcome"] in NO_RETRY:
         return first
     second = check_attempt(claude, target, os_name)
     duration = first["durationMs"] + second["durationMs"]
-    if (second["outcome"], second["message"]) == (first["outcome"], first["message"]):
+    if second["outcome"] == first["outcome"]:
         return {**first, "durationMs": duration}
     message = (
         f"flaky: attempts disagreed: {first['outcome']} then {second['outcome']}\n"
@@ -408,11 +410,11 @@ def iso_or_none(value: str | None) -> str | None:
         return None
     try:
         parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    except (ValueError, OverflowError):  # OverflowError: year 1 or 9999 shifted out of range
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
-    return parsed.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def report(
