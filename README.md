@@ -15,8 +15,24 @@ itself has confirmed the refusal.
   the commit Claude Code recorded in `installed_plugins.json` (null when it records none). The
   load split follows `plugin list --json` `errorDetails[].type` (claudepluginhub cli-oracle c25:
   `generic-error` means nothing loads).
-- **When:** hourly (`.github/workflows/verify.yml`). A plugin is checked again only when its
-  commit, its marketplace entry, its install route or the Claude Code version changes.
+- **When:** two lanes run the same jobs (`.github/workflows/run.yml`), each in its own concurrency
+  group so neither waits on the other:
+  - **Full** (`verify.yml`, group `cli-verify`): hourly, and by hand with `slugs` or `force`. A
+    plugin is checked again when its commit, its marketplace entry, its install route or the Claude
+    Code version changes, or its last result was `error`.
+  - **Fast** (`verify-fast.yml`, group `cli-verify-fast`): dispatched by claudepluginhub.com, input
+    `requested_at` (ISO 8601, optional). Checks only plugins whose check key differs from their
+    stored result on that OS (or that have none), at most 50 per OS (`verify.py plan --mode keys
+    --max 50`); Claude Code versions and earlier errors are left to the full lane. The dispatch
+    carries no plugin list: GitHub keeps one pending run per group and replaces it, so the plan is
+    recomputed from the live targets.
+- **Retry:** a result other than `installed` or `error` is checked once more, from scratch, in a fresh
+  `HOME` and `CLAUDE_CONFIG_DIR`. The same outcome stands, with the first attempt's message; a
+  different outcome is reported as `error` with a message starting `flaky: attempts disagreed: `, so
+  no owner alert rests on one attempt. Network failures (`TRANSIENT_RE`) are `error` as before.
+- **Report body:** `{runId, runUrl, cliVersion, lane, runStartedAt, requestedAt, results}`. `lane`
+  is `"full"` or `"fast"`, `runStartedAt` is when the plan job started (`…Z`), `requestedAt` is the
+  fast lane's `requested_at` normalized to UTC `…Z`, or `null` (full lane, or missing/unreadable).
 - **Isolation:** the check jobs hold no secrets, no write permissions and no caches. Only the report
   job, which runs no plugin code, holds the secret that posts results to claudepluginhub.com. It
   reports a result only if the plan job planned that plugin, check key and OS, from the artifact of

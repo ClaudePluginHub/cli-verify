@@ -4,9 +4,11 @@
 Three steps, one per workflow job:
   plan    targets.json (from claudepluginhub.com/api/cli-checks/targets) -> plan.json: per OS, the
           targets whose check key (commit, marketplace entry, route) or CLI version changed since
-          their stored result.
+          their stored result (`--mode full`), or only whose check key changed (`--mode keys`,
+          the fast lane).
   check   plan.json -> results-<os>.json: install each planned target in a throwaway HOME and
-          CLAUDE_CONFIG_DIR, 8 at a time. Runs third-party code paths; the job holds no secrets.
+          CLAUDE_CONFIG_DIR, 8 at a time; a result other than installed or error is checked once
+          more in a fresh one (check_one). Runs third-party code paths; the job holds no secrets.
   report  plan.json + results-*.json -> report.json, the body POSTed to /api/cli-checks/results:
           only the results the plan asked of each OS (accept_results).
 
@@ -57,23 +59,31 @@ SECRET_ENV_RE = re.compile(r"TOKEN|SECRET|PASSWORD|CREDENTIAL|_KEY$|^ACTIONS_|^G
 # ---------------------------------------------------------------- plan
 
 
-def needs_check(target: dict, os_name: str, cli_version: str) -> bool:
+def needs_check(target: dict, os_name: str, cli_version: str, mode: str = "full") -> bool:
+    """`full`: a new check key, a new Claude Code version or a last result of `error`. `keys` (the
+    fast lane): a new check key only; versions and errors stay the hourly full run's job."""
     last = (target.get("last") or {}).get(os_name)
-    return (
-        last is None
-        or last.get("checkKey") != target["checkKey"]
-        or last.get("cliVersion") != cli_version
-        or last.get("outcome") == "error"
-    )
+    if last is None or last.get("checkKey") != target["checkKey"]:
+        return True
+    return mode == "full" and (last.get("cliVersion") != cli_version or last.get("outcome") == "error")
 
 
-def plan(targets: list[dict], cli_version: str, force: bool = False, slugs: set[str] | None = None) -> dict:
+def plan(
+    targets: list[dict],
+    cli_version: str,
+    force: bool = False,
+    slugs: set[str] | None = None,
+    mode: str = "full",
+    max_per_os: int | None = None,
+) -> dict:
     work: dict[str, list[dict]] = {os_name: [] for os_name in OSES}
     for target in targets:
         if slugs and target["slug"] not in slugs:
             continue
         for os_name in OSES:
-            if force or slugs or needs_check(target, os_name, cli_version):
+            if max_per_os is not None and len(work[os_name]) >= max_per_os:
+                continue
+            if force or slugs or needs_check(target, os_name, cli_version, mode):
                 work[os_name].append(
                     {k: target[k] for k in ("pluginId", "slug", "addArg", "installArg", "checkKey")}
                 )
@@ -228,7 +238,8 @@ def kill_tree(proc: subprocess.Popen) -> None:
         pass
 
 
-def check_one(claude: str, target: dict, os_name: str) -> dict:
+def check_attempt(claude: str, target: dict, os_name: str) -> dict:
+    """One install of the target in its own throwaway HOME and CLAUDE_CONFIG_DIR."""
     root = Path(tempfile.mkdtemp(prefix="cliv-"))
     started = time.monotonic()
 
@@ -297,6 +308,35 @@ def check_one(claude: str, target: dict, os_name: str) -> dict:
         shutil.rmtree(root, ignore_errors=True)
 
 
+# Outcomes final after one attempt: a clean install, and `error` (already retried next run).
+NO_RETRY = {"installed", "error"}
+
+
+def check_one(claude: str, target: dict, os_name: str) -> dict:
+    """A refusal or load problem is what owners get alerted on, so it must repeat: the whole check
+    runs once more in a fresh HOME and CLAUDE_CONFIG_DIR. The same outcome stands (with the first
+    attempt's message: wording that differs, e.g. a path normalization misses, must not turn a
+    deterministic refusal into an error); a different one is reported as `error`, which the hourly
+    run retries."""
+    first = check_attempt(claude, target, os_name)
+    if first["outcome"] in NO_RETRY:
+        return first
+    second = check_attempt(claude, target, os_name)
+    duration = first["durationMs"] + second["durationMs"]
+    if second["outcome"] == first["outcome"]:
+        return {**first, "durationMs": duration}
+    message = (
+        f"flaky: attempts disagreed: {first['outcome']} then {second['outcome']}\n"
+        f"1: {first['message'] or ''}\n2: {second['message'] or ''}"
+    )
+    return {
+        **{k: first[k] for k in ("pluginId", "os", "checkKey", "checkedAt")},
+        "outcome": "error",
+        "message": message if len(message) <= MESSAGE_MAX else message[: MESSAGE_MAX - 1] + "…",
+        "durationMs": duration,
+    }
+
+
 def check(plan_data: dict, os_name: str, concurrency: int, out: Path) -> list[dict]:
     """Installs every planned target; `out` is rewritten as results land, so a job that hits its
     time limit still uploads what it finished (the rest is planned again next run)."""
@@ -363,7 +403,30 @@ def accept_results(plan_data: dict, results_by_os: dict[str, list]) -> tuple[lis
     return accepted, dropped
 
 
-def report(results_dir: Path, plan_data: dict, run_id: int, run_url: str, cli_version: str) -> tuple[dict, dict[str, int]]:
+def iso_or_none(value: str | None) -> str | None:
+    """An ISO 8601 timestamp as UTC `…Z`, or None for empty or unreadable input (a dispatch input is
+    free text)."""
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    except (ValueError, OverflowError):  # OverflowError: year 1 or 9999 shifted out of range
+        return None
+
+
+def report(
+    results_dir: Path,
+    plan_data: dict,
+    run_id: int,
+    run_url: str,
+    cli_version: str,
+    lane: str = "full",
+    run_started_at: str | None = None,
+    requested_at: str | None = None,
+) -> tuple[dict, dict[str, int]]:
     """`results_dir` holds one folder per check artifact (`results-<os>/results-<os>.json`); the
     OS comes from the artifact name the workflow gave it, never from the file's content."""
     results_by_os: dict[str, list] = {}
@@ -375,7 +438,16 @@ def report(results_dir: Path, plan_data: dict, run_id: int, run_url: str, cli_ve
             except ValueError:
                 results_by_os[os_name] = None  # counted as "not a list"
     results, dropped = accept_results(plan_data, results_by_os)
-    return {"runId": run_id, "runUrl": run_url, "cliVersion": cli_version, "results": results}, dropped
+    body = {
+        "runId": run_id,
+        "runUrl": run_url,
+        "cliVersion": cli_version,
+        "lane": lane,
+        "runStartedAt": iso_or_none(run_started_at),
+        "requestedAt": iso_or_none(requested_at),
+        "results": results,
+    }
+    return body, dropped
 
 
 def main() -> None:
@@ -386,6 +458,8 @@ def main() -> None:
     p.add_argument("--cli-version", required=True)
     p.add_argument("--force", action="store_true")
     p.add_argument("--slugs", default="")
+    p.add_argument("--mode", choices=("full", "keys"), default="full")
+    p.add_argument("--max", type=int, default=None, help="at most this many targets per OS")
     p.add_argument("--out", type=Path, required=True)
     c = sub.add_parser("check")
     c.add_argument("--plan", type=Path, required=True)
@@ -398,13 +472,16 @@ def main() -> None:
     r.add_argument("--run-id", type=int, required=True)
     r.add_argument("--run-url", required=True)
     r.add_argument("--cli-version", required=True)
+    r.add_argument("--lane", choices=("fast", "full"), default="full")
+    r.add_argument("--run-started-at", default="")
+    r.add_argument("--requested-at", default="")
     r.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
 
     if args.step == "plan":
         targets = json.loads(args.targets.read_text())["targets"]
         slugs = {s.strip() for s in args.slugs.split(",") if s.strip()} or None
-        data = plan(targets, args.cli_version, args.force, slugs)
+        data = plan(targets, args.cli_version, args.force, slugs, args.mode, args.max)
         args.out.write_text(json.dumps(data))
         oses = [o for o in OSES if data["work"][o]]
         print(json.dumps({"os": oses, "counts": {o: len(data["work"][o]) for o in OSES}}))
@@ -412,7 +489,14 @@ def main() -> None:
         check(json.loads(args.plan.read_text()), args.os, args.concurrency, args.out)
     else:
         body, dropped = report(
-            args.results_dir, json.loads(args.plan.read_text()), args.run_id, args.run_url, args.cli_version
+            args.results_dir,
+            json.loads(args.plan.read_text()),
+            args.run_id,
+            args.run_url,
+            args.cli_version,
+            args.lane,
+            args.run_started_at,
+            args.requested_at,
         )
         args.out.write_text(json.dumps(body))
         print(f"Dropped results the plan did not ask for: {json.dumps(dropped, sort_keys=True)}")

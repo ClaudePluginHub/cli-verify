@@ -1,7 +1,9 @@
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -158,6 +160,48 @@ class CheckOneTest(unittest.TestCase):
         self.assertIn("refusing to run claude", result["message"])
 
 
+class RetryTest(unittest.TestCase):
+    """check_one with check_attempt stubbed: each call returns the next scripted result."""
+
+    target = {"pluginId": "1", "slug": "a", "addArg": "x", "installArg": "a@m", "checkKey": "k1"}
+
+    def run_with(self, *attempts):
+        calls = []
+
+        def attempt(claude, target, os_name):
+            outcome, message = attempts[len(calls)]
+            calls.append(outcome)
+            return {"pluginId": "1", "os": os_name, "checkKey": "k1", "outcome": outcome, "message": message,
+                    "checkedAt": "2026-10-24T10:00:00Z", "durationMs": 100, "loadErrors": []}
+
+        with mock.patch.object(verify, "check_attempt", attempt):
+            return verify.check_one("claude", self.target, "linux"), len(calls)
+
+    def test_installed_and_error_are_not_retried(self):
+        for outcome in ("installed", "error"):
+            result, calls = self.run_with((outcome, None))
+            self.assertEqual((result["outcome"], calls), (outcome, 1))
+
+    def test_agreeing_attempts_keep_the_result(self):
+        result, calls = self.run_with(("install_refused", "bad manifest"), ("install_refused", "bad manifest"))
+        self.assertEqual((result["outcome"], result["message"], calls), ("install_refused", "bad manifest", 2))
+        self.assertEqual(result["durationMs"], 200)
+        self.assertEqual(result["loadErrors"], [])
+        # Same outcome, other words (a path normalization missed): the first attempt's result stands.
+        result, _ = self.run_with(("load_warnings", "Path not found: /tmp/a"), ("load_warnings", "Path not found: /tmp/b"))
+        self.assertEqual((result["outcome"], result["message"]), ("load_warnings", "Path not found: /tmp/a"))
+
+    def test_disagreeing_attempts_are_an_error(self):
+        result, calls = self.run_with(("install_refused", "bad manifest"), ("installed", None))
+        self.assertEqual((result["outcome"], calls), ("error", 2))
+        self.assertTrue(result["message"].startswith("flaky: attempts disagreed: install_refused then installed"))
+        self.assertNotIn("loadErrors", result)
+        self.assertIn("1: bad manifest", result["message"])
+        # A transient failure on the second attempt is not confirmation.
+        result, _ = self.run_with(("add_refused", "bad name"), ("error", "Could not resolve host"))
+        self.assertEqual(result["outcome"], "error")
+
+
 class EnvTest(unittest.TestCase):
     def test_strips_secrets_and_isolates_config(self):
         import os
@@ -198,6 +242,24 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(len(verify.plan([t], "2.1.302", force=True)["work"]["linux"]), 1)
         self.assertEqual(len(verify.plan([t], "2.1.302", slugs={"a"})["work"]["windows"]), 1)
         self.assertEqual(len(verify.plan([t], "2.1.302", slugs={"zzz"})["work"]["windows"]), 0)
+
+
+    def test_keys_mode_ignores_cli_version_and_errors(self):
+        last = {
+            "linux": {"cliVersion": "2.1.301", "checkKey": "k1", "outcome": "installed"},
+            "macos": {"cliVersion": "2.1.302", "checkKey": "k1", "outcome": "error"},
+            "windows": {"cliVersion": "2.1.302", "checkKey": "k0", "outcome": "installed"},
+        }
+        targets = [{**self.target, "last": last}, {**self.target, "pluginId": "2", "slug": "b", "last": {}}]
+        work = verify.plan(targets, "2.1.302", mode="keys")["work"]
+        self.assertEqual({o: [t["slug"] for t in w] for o, w in work.items()},
+                         {"linux": ["b"], "macos": ["b"], "windows": ["a", "b"]})
+
+    def test_max_caps_each_os(self):
+        targets = [{**self.target, "pluginId": str(i), "slug": f"s{i}", "last": {}} for i in range(5)]
+        work = verify.plan(targets, "2.1.302", mode="keys", max_per_os=2)["work"]
+        self.assertEqual([t["slug"] for t in work["linux"]], ["s0", "s1"])
+        self.assertEqual(len(work["windows"]), 2)
 
 
 class ReportTest(unittest.TestCase):
@@ -259,6 +321,35 @@ class ReportTest(unittest.TestCase):
             }
         )
         self.assertEqual((accepted, dropped), ([("p2", "linux")], {"bad id or key": 3}))
+
+    def test_lane_and_timestamps_at_the_top_level(self):
+        with tempfile.TemporaryDirectory() as d:
+            body, _ = verify.report(Path(d), self.plan, 1, "u", "2.1.302", "fast", "2026-10-24T10:00:05Z",
+                                    "2026-10-24T11:59:58.123+02:00")
+            self.assertEqual((body["lane"], body["runStartedAt"], body["requestedAt"]),
+                             ("fast", "2026-10-24T10:00:05Z", "2026-10-24T09:59:58Z"))
+            body, _ = verify.report(Path(d), self.plan, 1, "u", "2.1.302", "full", "2026-10-24T10:00:05Z", "")
+            self.assertIsNone(body["requestedAt"])
+            body, _ = verify.report(Path(d), self.plan, 1, "u", "2.1.302", "fast", "", "not a date")
+            self.assertEqual((body["runStartedAt"], body["requestedAt"]), (None, None))
+            # Shifting year 1 or 9999 to UTC overflows: unreadable, not a crash.
+            for edge in ("0001-01-01T00:00:00+05:00", "9999-12-31T23:59:59-05:00"):
+                body, _ = verify.report(Path(d), self.plan, 1, "u", "2.1.302", "fast", "", edge)
+                self.assertIsNone(body["requestedAt"], edge)
+
+    def test_cli_takes_a_requested_at_that_looks_like_a_flag(self):
+        # The workflow passes --requested-at=<input>: a dispatch input of "-x" must not end the report.
+        with tempfile.TemporaryDirectory() as d:
+            plan_path, out = Path(d) / "plan.json", Path(d) / "report.json"
+            plan_path.write_text(json.dumps(self.plan))
+            subprocess.run(
+                [sys.executable, str(Path(verify.__file__)), "report", "--results-dir", d, "--plan", str(plan_path),
+                 "--run-id", "1", "--run-url", "u", "--cli-version", "2.1.302", "--lane", "fast",
+                 "--run-started-at=2026-10-24T10:00:05Z", "--requested-at=-x", "--out", str(out)],
+                check=True, capture_output=True,
+            )
+            body = json.loads(out.read_text())
+            self.assertEqual((body["requestedAt"], body["runStartedAt"]), (None, "2026-10-24T10:00:05Z"))
 
     def test_drops_a_file_that_is_not_a_list(self):
         accepted, dropped = self.build({"linux": {"pluginId": "p1"}})

@@ -1,0 +1,33 @@
+name: Verify with Claude Code (fast lane)
+
+# Dispatched by claudepluginhub.com when a target's check key changes (new commit, marketplace entry
+# or install route), so an owner hears within minutes instead of at the next hourly run. Checks only
+# targets whose check key differs from their stored result on that OS, at most 50 per OS; Claude
+# Code version changes and earlier errors stay the hourly full run's job (verify.yml).
+#
+# Its own concurrency group, so a long full run after a Claude Code release never holds it up.
+# Dispatches carry no plugin list on purpose: GitHub keeps one pending run per group and replaces it,
+# so the plan recomputes from the live targets.
+
+on:
+  workflow_dispatch:
+    inputs:
+      requested_at:
+        description: When the site requested this run (ISO 8601), reported as requestedAt
+        required: false
+        default: ''
+
+permissions: {}
+
+concurrency:
+  group: cli-verify-fast
+  cancel-in-progress: false
+
+jobs:
+  run:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/run.yml
+    with:
+      lane: fast
+      requested_at: ${{ inputs.requested_at }}
