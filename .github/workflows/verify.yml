@@ -146,12 +146,27 @@ jobs:
         with:
           name: plan
           path: plan
-      # One folder per artifact (no merge): a result's OS is the artifact it came in, and a check job
-      # can't drop a file into another OS's folder.
+      # One download per OS, by name, into that OS's folder: a result's OS is the artifact it came in,
+      # and a check job can't drop a file into another OS's folder. (A `pattern` download extracts
+      # flat when only one artifact matches.) A job that died before uploading reports nothing.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: contains(needs.plan.outputs.matrix, '"os":"linux"')
+        continue-on-error: true
         with:
-          pattern: results-*
-          path: results
+          name: results-linux
+          path: results/results-linux
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: contains(needs.plan.outputs.matrix, '"os":"macos"')
+        continue-on-error: true
+        with:
+          name: results-macos
+          path: results/results-macos
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: contains(needs.plan.outputs.matrix, '"os":"windows"')
+        continue-on-error: true
+        with:
+          name: results-windows
+          path: results/results-windows
       - name: Build the report
         env:
           CLI: ${{ needs.plan.outputs.cli }}

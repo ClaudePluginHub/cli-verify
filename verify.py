@@ -347,6 +347,8 @@ def accept_results(plan_data: dict, results_by_os: dict[str, list]) -> tuple[lis
         for r in results:
             if not isinstance(r, dict):
                 drop("not an object")
+            elif not isinstance(r.get("pluginId"), str) or not isinstance(r.get("checkKey"), str):
+                drop("bad id or key")
             elif r.get("os") != os_name:
                 drop("wrong os")
             elif (r.get("pluginId"), r.get("checkKey")) not in planned:

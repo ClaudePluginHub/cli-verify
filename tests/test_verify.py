@@ -247,6 +247,19 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(accepted, [("p1", "linux"), ("p1", "windows")])
         self.assertEqual(dropped, {"not planned": 3, "wrong os": 1, "duplicate": 2})
 
+    def test_drops_non_string_ids_and_keys(self):
+        accepted, dropped = self.build(
+            {
+                "linux": [
+                    {"pluginId": ["p1"], "os": "linux", "checkKey": "k1"},
+                    {"pluginId": "p1", "os": "linux", "checkKey": {"k": 1}},
+                    {"os": "linux", "checkKey": "k1"},
+                    self.result("p2", "linux", "k2"),
+                ]
+            }
+        )
+        self.assertEqual((accepted, dropped), ([("p2", "linux")], {"bad id or key": 3}))
+
     def test_drops_a_file_that_is_not_a_list(self):
         accepted, dropped = self.build({"linux": {"pluginId": "p1"}})
         self.assertEqual((accepted, dropped), ([], {"not a list": 1}))
