@@ -2,6 +2,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -158,6 +159,47 @@ class CheckOneTest(unittest.TestCase):
         self.assertIn("refusing to run claude", result["message"])
 
 
+class RetryTest(unittest.TestCase):
+    """check_one with check_attempt stubbed: each call returns the next scripted result."""
+
+    target = {"pluginId": "1", "slug": "a", "addArg": "x", "installArg": "a@m", "checkKey": "k1"}
+
+    def run_with(self, *attempts):
+        calls = []
+
+        def attempt(claude, target, os_name):
+            outcome, message = attempts[len(calls)]
+            calls.append(outcome)
+            return {"pluginId": "1", "os": os_name, "checkKey": "k1", "outcome": outcome, "message": message,
+                    "checkedAt": "2026-10-24T10:00:00Z", "durationMs": 100, "loadErrors": []}
+
+        with mock.patch.object(verify, "check_attempt", attempt):
+            return verify.check_one("claude", self.target, "linux"), len(calls)
+
+    def test_installed_and_error_are_not_retried(self):
+        for outcome in ("installed", "error"):
+            result, calls = self.run_with((outcome, None))
+            self.assertEqual((result["outcome"], calls), (outcome, 1))
+
+    def test_agreeing_attempts_keep_the_result(self):
+        result, calls = self.run_with(("install_refused", "bad manifest"), ("install_refused", "bad manifest"))
+        self.assertEqual((result["outcome"], result["message"], calls), ("install_refused", "bad manifest", 2))
+        self.assertEqual(result["durationMs"], 200)
+        self.assertEqual(result["loadErrors"], [])
+
+    def test_disagreeing_attempts_are_an_error(self):
+        result, calls = self.run_with(("install_refused", "bad manifest"), ("installed", None))
+        self.assertEqual((result["outcome"], calls), ("error", 2))
+        self.assertTrue(result["message"].startswith("flaky: attempts disagreed: install_refused then installed"))
+        self.assertNotIn("loadErrors", result)
+        # Same outcome, other words: also flaky.
+        result, _ = self.run_with(("load_warnings", "Path not found: a"), ("load_warnings", "Path not found: b"))
+        self.assertTrue(result["message"].startswith("flaky: attempts disagreed: load_warnings then load_warnings"))
+        # A transient failure on the second attempt is not confirmation.
+        result, _ = self.run_with(("add_refused", "bad name"), ("error", "Could not resolve host"))
+        self.assertEqual(result["outcome"], "error")
+
+
 class EnvTest(unittest.TestCase):
     def test_strips_secrets_and_isolates_config(self):
         import os
@@ -198,6 +240,24 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(len(verify.plan([t], "2.1.302", force=True)["work"]["linux"]), 1)
         self.assertEqual(len(verify.plan([t], "2.1.302", slugs={"a"})["work"]["windows"]), 1)
         self.assertEqual(len(verify.plan([t], "2.1.302", slugs={"zzz"})["work"]["windows"]), 0)
+
+
+    def test_keys_mode_ignores_cli_version_and_errors(self):
+        last = {
+            "linux": {"cliVersion": "2.1.301", "checkKey": "k1", "outcome": "installed"},
+            "macos": {"cliVersion": "2.1.302", "checkKey": "k1", "outcome": "error"},
+            "windows": {"cliVersion": "2.1.302", "checkKey": "k0", "outcome": "installed"},
+        }
+        targets = [{**self.target, "last": last}, {**self.target, "pluginId": "2", "slug": "b", "last": {}}]
+        work = verify.plan(targets, "2.1.302", mode="keys")["work"]
+        self.assertEqual({o: [t["slug"] for t in w] for o, w in work.items()},
+                         {"linux": ["b"], "macos": ["b"], "windows": ["a", "b"]})
+
+    def test_max_caps_each_os(self):
+        targets = [{**self.target, "pluginId": str(i), "slug": f"s{i}", "last": {}} for i in range(5)]
+        work = verify.plan(targets, "2.1.302", mode="keys", max_per_os=2)["work"]
+        self.assertEqual([t["slug"] for t in work["linux"]], ["s0", "s1"])
+        self.assertEqual(len(work["windows"]), 2)
 
 
 class ReportTest(unittest.TestCase):
@@ -259,6 +319,17 @@ class ReportTest(unittest.TestCase):
             }
         )
         self.assertEqual((accepted, dropped), ([("p2", "linux")], {"bad id or key": 3}))
+
+    def test_lane_and_timestamps_at_the_top_level(self):
+        with tempfile.TemporaryDirectory() as d:
+            body, _ = verify.report(Path(d), self.plan, 1, "u", "2.1.302", "fast", "2026-10-24T10:00:05Z",
+                                    "2026-10-24T11:59:58.123+02:00")
+            self.assertEqual((body["lane"], body["runStartedAt"], body["requestedAt"]),
+                             ("fast", "2026-10-24T10:00:05Z", "2026-10-24T09:59:58Z"))
+            body, _ = verify.report(Path(d), self.plan, 1, "u", "2.1.302", "full", "2026-10-24T10:00:05Z", "")
+            self.assertIsNone(body["requestedAt"])
+            body, _ = verify.report(Path(d), self.plan, 1, "u", "2.1.302", "fast", "", "not a date")
+            self.assertEqual((body["runStartedAt"], body["requestedAt"]), (None, None))
 
     def test_drops_a_file_that_is_not_a_list(self):
         accepted, dropped = self.build({"linux": {"pluginId": "p1"}})

@@ -1,0 +1,199 @@
+name: Verify run
+
+# The plan → check (Linux, macOS, Windows) → report jobs, called by verify.yml (hourly full lane) and
+# verify-fast.yml (dispatched fast lane). Each caller holds its own concurrency group.
+#
+# Trust model: the check jobs install third-party plugins, so they get no secrets, no write
+# permissions and no caches. Only the report job, which runs no plugin code, holds the ingest secret
+# (an `ingest` environment secret, which a called workflow's job reads directly).
+
+on:
+  workflow_call:
+    inputs:
+      lane:
+        description: full (new key, new Claude Code version or last error) or fast (new key only)
+        type: string
+        required: true
+      slugs:
+        type: string
+        default: ''
+      force:
+        type: boolean
+        default: false
+      requested_at:
+        description: When the fast lane was requested (ISO 8601), reported as requestedAt
+        type: string
+        default: ''
+
+permissions: {}
+
+env:
+  SITE: https://www.claudepluginhub.com
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      started-at: ${{ steps.started.outputs.at }}
+      cli: ${{ steps.plan.outputs.cli }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      # The report job checks the plan artifact against this: a job output can't be changed by a
+      # later job, an artifact could be replaced by one that gets hold of the runtime token.
+      plan-sha256: ${{ steps.plan.outputs.plan-sha256 }}
+    steps:
+      - name: Started
+        id: started
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Unit tests
+        run: python3 -m unittest tests/test_verify.py
+      - name: Latest Claude Code version
+        run: |
+          curl -fsSL https://claude.ai/install.sh -o install-claude.sh
+          bash install-claude.sh latest
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Plan
+        id: plan
+        env:
+          SLUGS: ${{ inputs.slugs }}
+          FORCE: ${{ inputs.force && '--force' || '' }}
+          # The fast lane re-plans from live targets on every run (dispatches carry no plugin list:
+          # GitHub keeps one pending run per concurrency group and replaces it), capped at 50 per OS.
+          MODE: ${{ inputs.lane == 'fast' && '--mode keys --max 50' || '--mode full' }}
+          LANE: ${{ inputs.lane }}
+        run: |
+          set -euo pipefail
+          cli=$(claude --version | awk '{print $1}')
+          [[ "$cli" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::unreadable version '$cli'"; exit 1; }
+          curl -fsS --retry 3 "$SITE/api/cli-checks/targets" -o targets.json
+          python3 verify.py plan --targets targets.json --cli-version "$cli" --slugs "$SLUGS" $FORCE $MODE --out plan.json | tee plan-summary.json
+          matrix=$(python3 -c 'import json; s=json.load(open("plan-summary.json")); r={"linux":["ubuntu-latest","python3"],"macos":["macos-latest","python3"],"windows":["windows-latest","python"]}; print(json.dumps({"include":[{"os":o,"runner":r[o][0],"py":r[o][1]} for o in s["os"]]}, separators=(",",":")))')
+          echo "cli=$cli" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "plan-sha256=$(sha256sum plan.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "$LANE lane, Claude Code $cli: $(cat plan-summary.json)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan
+          path: plan.json
+          retention-days: 7
+
+  check:
+    needs: plan
+    if: needs.plan.outputs.matrix != '{"include":[]}'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    # A new Claude Code version re-checks every target; Windows takes longest. Results are saved as
+    # they land, so a job that runs out of time still reports what it finished.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan
+      - name: Install Claude Code ${{ needs.plan.outputs.cli }} (Linux, macOS)
+        if: matrix.os != 'windows'
+        env:
+          CLI: ${{ needs.plan.outputs.cli }}
+        run: |
+          curl -fsSL https://claude.ai/install.sh -o install-claude.sh
+          bash install-claude.sh "$CLI"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install Claude Code ${{ needs.plan.outputs.cli }} (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          CLI: ${{ needs.plan.outputs.cli }}
+        run: |
+          & ([scriptblock]::Create((irm https://claude.ai/install.ps1))) $env:CLI
+          "$env:USERPROFILE\.local\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: What this OS tests
+        run: |
+          claude --version
+          git --version
+          echo "core.symlinks=$(git config --get core.symlinks || echo unset) core.longpaths=$(git config --get core.longpaths || echo unset) core.ignorecase=$(git config --get core.ignorecase || echo unset)"
+          d=$(mktemp -d); touch "$d/a" "$d/A"; echo "case-sensitive filesystem: $([ "$(ls "$d" | wc -l)" -eq 2 ] && echo yes || echo no)"
+      - name: Install every planned plugin
+        run: ${{ matrix.py }} verify.py check --plan plan.json --os ${{ matrix.os }} --out results-${{ matrix.os }}.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: results-${{ matrix.os }}
+          path: results-${{ matrix.os }}.json
+          retention-days: 30
+
+  report:
+    needs: [plan, check]
+    # Also when nothing was planned or an OS failed: the report is the heartbeat, and partial results still count.
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The ingest secret lives in this environment, which only runs from main.
+    environment: ingest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan
+          path: plan
+      # One download per OS, by name, into that OS's folder: a result's OS is the artifact it came in,
+      # and a check job can't drop a file into another OS's folder. (A `pattern` download extracts
+      # flat when only one artifact matches.) A job that died before uploading reports nothing.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: contains(needs.plan.outputs.matrix, '"os":"linux"')
+        continue-on-error: true
+        with:
+          name: results-linux
+          path: results/results-linux
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: contains(needs.plan.outputs.matrix, '"os":"macos"')
+        continue-on-error: true
+        with:
+          name: results-macos
+          path: results/results-macos
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: contains(needs.plan.outputs.matrix, '"os":"windows"')
+        continue-on-error: true
+        with:
+          name: results-windows
+          path: results/results-windows
+      - name: Build the report
+        env:
+          CLI: ${{ needs.plan.outputs.cli }}
+          PLAN_SHA256: ${{ needs.plan.outputs.plan-sha256 }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          LANE: ${{ inputs.lane }}
+          STARTED_AT: ${{ needs.plan.outputs.started-at }}
+          REQUESTED_AT: ${{ inputs.requested_at }}
+        run: |
+          set -euo pipefail
+          echo "$PLAN_SHA256  plan/plan.json" | sha256sum -c --quiet || { echo "::error::plan artifact differs from what the plan job wrote"; exit 1; }
+          # Only (plugin, OS, key) the plan asked for, one per plugin and OS; the rest is dropped and counted.
+          python3 verify.py report --results-dir results --plan plan/plan.json --run-id "$GITHUB_RUN_ID" --run-url "$RUN_URL" --cli-version "$CLI" \
+            --lane "$LANE" --run-started-at "$STARTED_AT" --requested-at "$REQUESTED_AT" --out report.json | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 -c 'import json,collections; r=json.load(open("report.json"))["results"]; print(collections.Counter((x["os"],x["outcome"]) for x in r))' >> "$GITHUB_STEP_SUMMARY"
+      - name: Send to claudepluginhub.com
+        env:
+          CLI_CHECK_INGEST_SECRET: ${{ secrets.CLI_CHECK_INGEST_SECRET }}
+        run: |
+          curl -fsS --retry 3 --retry-all-errors -X POST "$SITE/api/cli-checks/results" \
+            -H "Authorization: Bearer $CLI_CHECK_INGEST_SECRET" -H 'content-type: application/json' \
+            --data-binary @report.json
