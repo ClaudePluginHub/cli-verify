@@ -30,6 +30,8 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/run.yml
+    # The ingest secret is a repository secret: a called workflow only sees it when passed on.
+    secrets: inherit
     with:
       lane: full
       slugs: ${{ inputs.slugs || '' }}
