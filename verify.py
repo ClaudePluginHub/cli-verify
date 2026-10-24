@@ -7,7 +7,8 @@ Three steps, one per workflow job:
           their stored result.
   check   plan.json -> results-<os>.json: install each planned target in a throwaway HOME and
           CLAUDE_CONFIG_DIR, 8 at a time. Runs third-party code paths; the job holds no secrets.
-  report  results-*.json -> report.json, the body POSTed to /api/cli-checks/results.
+  report  plan.json + results-*.json -> report.json, the body POSTed to /api/cli-checks/results:
+          only the results the plan asked of each OS (accept_results).
 
 Only `claude plugin marketplace add <x>`, `claude plugin install <x> --json` and
 `claude plugin list --json` are ever run (see cli_argv). Never a session, `-p` or `claude mcp`
@@ -322,11 +323,57 @@ def check(plan_data: dict, os_name: str, concurrency: int, out: Path) -> list[di
 # ---------------------------------------------------------------- report
 
 
-def report(result_files: list[Path], run_id: int, run_url: str, cli_version: str) -> dict:
-    results: list[dict] = []
-    for path in result_files:
-        results.extend(json.loads(path.read_text()))
-    return {"runId": run_id, "runUrl": run_url, "cliVersion": cli_version, "results": results}
+def accept_results(plan_data: dict, results_by_os: dict[str, list]) -> tuple[list[dict], dict[str, int]]:
+    """The results a check job may report: each OS's file only for that OS, only (pluginId,
+    checkKey) pairs the plan job planned for that OS, at most one per plugin. Anything else is
+    dropped and counted by reason.
+
+    A check job runs third-party code paths and the check keys are public, so its results file is
+    untrusted: without this, a job could claim any plugin's result on any OS. A job can still lie
+    about the plugins planned for its own OS (see README, Isolation)."""
+    accepted: list[dict] = []
+    dropped: dict[str, int] = {}
+
+    def drop(reason: str, n: int = 1) -> None:
+        dropped[reason] = dropped.get(reason, 0) + n
+
+    for os_name, results in results_by_os.items():
+        planned = {(t["pluginId"], t["checkKey"]) for t in plan_data["work"].get(os_name, [])}
+        if not isinstance(results, list):
+            drop("not a list")
+            continue
+        kept: dict[str, dict] = {}
+        duplicated: set[str] = set()
+        for r in results:
+            if not isinstance(r, dict):
+                drop("not an object")
+            elif r.get("os") != os_name:
+                drop("wrong os")
+            elif (r.get("pluginId"), r.get("checkKey")) not in planned:
+                drop("not planned")
+            elif r["pluginId"] in kept or r["pluginId"] in duplicated:
+                # Which one is genuine is unknowable: drop them all (re-checked next run).
+                duplicated.add(r["pluginId"])
+                drop("duplicate", 1 + (kept.pop(r["pluginId"], None) is not None))
+            else:
+                kept[r["pluginId"]] = r
+        accepted.extend(kept.values())
+    return accepted, dropped
+
+
+def report(results_dir: Path, plan_data: dict, run_id: int, run_url: str, cli_version: str) -> tuple[dict, dict[str, int]]:
+    """`results_dir` holds one folder per check artifact (`results-<os>/results-<os>.json`); the
+    OS comes from the artifact name the workflow gave it, never from the file's content."""
+    results_by_os: dict[str, list] = {}
+    for os_name in OSES:
+        path = results_dir / f"results-{os_name}" / f"results-{os_name}.json"
+        if path.is_file():
+            try:
+                results_by_os[os_name] = json.loads(path.read_text(encoding="utf-8"))
+            except ValueError:
+                results_by_os[os_name] = None  # counted as "not a list"
+    results, dropped = accept_results(plan_data, results_by_os)
+    return {"runId": run_id, "runUrl": run_url, "cliVersion": cli_version, "results": results}, dropped
 
 
 def main() -> None:
@@ -344,7 +391,8 @@ def main() -> None:
     c.add_argument("--concurrency", type=int, default=8)
     c.add_argument("--out", type=Path, required=True)
     r = sub.add_parser("report")
-    r.add_argument("results", type=Path, nargs="*")
+    r.add_argument("--results-dir", type=Path, required=True)
+    r.add_argument("--plan", type=Path, required=True)
     r.add_argument("--run-id", type=int, required=True)
     r.add_argument("--run-url", required=True)
     r.add_argument("--cli-version", required=True)
@@ -361,7 +409,13 @@ def main() -> None:
     elif args.step == "check":
         check(json.loads(args.plan.read_text()), args.os, args.concurrency, args.out)
     else:
-        args.out.write_text(json.dumps(report(args.results, args.run_id, args.run_url, args.cli_version)))
+        body, dropped = report(
+            args.results_dir, json.loads(args.plan.read_text()), args.run_id, args.run_url, args.cli_version
+        )
+        args.out.write_text(json.dumps(body))
+        print(f"Dropped results the plan did not ask for: {json.dumps(dropped, sort_keys=True)}")
+        if dropped:
+            print(f"::warning::dropped results the plan did not ask for: {json.dumps(dropped, sort_keys=True)}")
 
 
 if __name__ == "__main__":
