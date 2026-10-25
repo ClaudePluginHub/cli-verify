@@ -12,10 +12,11 @@ Three steps, one per workflow job:
   report  plan.json + results-*.json -> report.json, the body POSTed to /api/cli-checks/results:
           only the results the plan asked of each OS (accept_results).
 
-Only `claude plugin marketplace add <x>`, `claude plugin install <x> --json` and
-`claude plugin list --json` are ever run (see cli_argv). Never a session, `-p` or `claude mcp`
-(which starts a plugin's MCP servers). stdin is never a terminal, so Claude Code never runs a
-marketplace entry's `command` source (it refuses them non-interactively; claudepluginhub c28).
+Only `claude plugin marketplace add <x>`, `claude plugin install <x> --json`,
+`claude plugin list --json` and `claude plugin marketplace list --json` are ever run (see cli_argv),
+plus the `claude plugin …` lines of a plugin's README that readme_args accepts (Linux only, see
+check_readme). Never a session, `-p` or `claude mcp` (which starts a plugin's MCP servers). stdin
+is never a terminal, so Claude Code never runs a marketplace entry's `command` source (it refuses them non-interactively; claudepluginhub c28).
 """
 
 from __future__ import annotations
@@ -68,6 +69,14 @@ def needs_check(target: dict, os_name: str, cli_version: str, mode: str = "full"
     return mode == "full" and (last.get("cliVersion") != cli_version or last.get("outcome") == "error")
 
 
+def readme_needs_check(readme: dict, cli_version: str, mode: str = "full") -> bool:
+    """Same rule as needs_check, for the README's stored result (Linux only)."""
+    last = readme.get("last")
+    if last is None or last.get("checkKey") != readme["checkKey"]:
+        return True
+    return mode == "full" and (last.get("cliVersion") != cli_version or last.get("outcome") == "error")
+
+
 def plan(
     targets: list[dict],
     cli_version: str,
@@ -77,9 +86,24 @@ def plan(
     max_per_os: int | None = None,
 ) -> dict:
     work: dict[str, list[dict]] = {os_name: [] for os_name in OSES}
+    readmes: list[dict] = []
     for target in targets:
         if slugs and target["slug"] not in slugs:
             continue
+        readme = target.get("readme")
+        if (
+            readme
+            and (max_per_os is None or len(readmes) < max_per_os)
+            and (force or slugs or readme_needs_check(readme, cli_version, mode))
+        ):
+            readmes.append(
+                {
+                    "pluginId": target["pluginId"],
+                    "slug": target["slug"],
+                    "checkKey": readme["checkKey"],
+                    "commands": [{k: c[k] for k in ("line", "kind", "argv")} for c in readme["commands"]],
+                }
+            )
         for os_name in OSES:
             if max_per_os is not None and len(work[os_name]) >= max_per_os:
                 continue
@@ -87,7 +111,7 @@ def plan(
                 work[os_name].append(
                     {k: target[k] for k in ("pluginId", "slug", "addArg", "installArg", "checkKey")}
                 )
-    return {"cliVersion": cli_version, "work": work}
+    return {"cliVersion": cli_version, "work": work, "readme": readmes}
 
 
 # ---------------------------------------------------------------- check
@@ -99,6 +123,7 @@ def cli_argv(claude: str, args: list[str]) -> list[str]:
         len(args) == 4 and args[:3] == ["plugin", "marketplace", "add"],
         len(args) == 4 and args[:2] == ["plugin", "install"] and args[3] == "--json",
         args == ["plugin", "list", "--json"],
+        args == ["plugin", "marketplace", "list", "--json"],
     )
     positional = args[3] if args[:3] == ["plugin", "marketplace", "add"] else args[2] if args[:2] == ["plugin", "install"] else ""
     if not any(shapes) or positional.startswith("-"):
@@ -238,33 +263,36 @@ def kill_tree(proc: subprocess.Popen) -> None:
         pass
 
 
+def run_cli(argv: list[str], env: dict[str, str], root: Path) -> subprocess.CompletedProcess:
+    """Runs an already validated argv in its own process group; a timeout ends the whole tree."""
+    group = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+    proc = subprocess.Popen(
+        argv,
+        env=env,
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        **group,
+    )
+    try:
+        out, err = proc.communicate(timeout=TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        kill_tree(proc)
+        raise
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+
+
 def check_attempt(claude: str, target: dict, os_name: str) -> dict:
     """One install of the target in its own throwaway HOME and CLAUDE_CONFIG_DIR."""
     root = Path(tempfile.mkdtemp(prefix="cliv-"))
     started = time.monotonic()
 
     def run(args: list[str]) -> subprocess.CompletedProcess:
-        group = (
-            {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
-        )
-        proc = subprocess.Popen(
-            cli_argv(claude, args),
-            env=env,
-            cwd=root,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            **group,
-        )
-        try:
-            out, err = proc.communicate(timeout=TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            kill_tree(proc)
-            raise
-        return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+        return run_cli(cli_argv(claude, args), env, root)
 
     def done(outcome: str, message: str | None, **listed: object) -> dict:
         return {
@@ -360,6 +388,274 @@ def check(plan_data: dict, os_name: str, concurrency: int, out: Path) -> list[di
     return results
 
 
+# ---------------------------------------------------------------- README commands (Linux)
+
+# The `claude plugin …` lines a README tells people to run, as the site extracted them
+# (claudepluginhub readme-commands.ts). The site's list is a proposal: readme_args re-validates every
+# argv, and nothing from the README is ever run through a shell.
+
+README_OUTCOMES = frozenset({"ok", "add_refused", "install_refused", "unknown_command", "not_checked", "error"})
+README_REFUSALS = frozenset({"add_refused", "install_refused", "unknown_command"})
+README_TOKEN_MAX = 300
+README_ARGV_MAX = 40
+# `claude plugin --help` on 2.1.310: any other word is what the CLI rejects.
+README_SUBCOMMANDS = frozenset(
+    "configure details disable enable eval help init new install i list marketplace prune autoremove"
+    " tag test uninstall remove update validate".split()
+)
+README_WORD_RE = re.compile(r"[A-Za-z][\w-]*")
+README_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+# A source this machine can't have or reach: a path, `~`, a drive, a file or ssh URL.
+README_LOCAL_RE = re.compile(r"^(\.{1,2}(/|$)|[/~]|[A-Za-z]:[\\/]|file:|ssh:|git@)", re.IGNORECASE)
+README_CONFIG_RE = re.compile(r"[\w.-]+=[\w./:@-]*")
+README_SCOPES = frozenset({"user", "project", "local"})
+UNKNOWN_COMMAND_RE = re.compile(r"unknown command", re.IGNORECASE)
+# Needs a credential this runner doesn't have: the README may be right for the people it addresses.
+AUTH_RE = re.compile(
+    r"could not read username|terminal prompts disabled|permission denied \(publickey\)"
+    r"|host key verification failed|authentication failed",
+    re.IGNORECASE,
+)
+
+
+def parse_flags(rest: list[str], spec: dict[str, str]) -> tuple[list[str], dict[str, list[str]]]:
+    """Positionals and `--flag value…` pairs; ValueError for an unknown flag, one without a value,
+    a repeated one or a bad scope. `spec` maps flag -> "one" | "many" | "scope" | "config"."""
+    positional: list[str] = []
+    flags: dict[str, list[str]] = {}
+    i = 0
+    while i < len(rest):
+        token = rest[i]
+        i += 1
+        if not token.startswith("-"):
+            positional.append(token)
+            continue
+        kind = spec.get(token)
+        if kind is None or (token in flags and kind != "config"):
+            raise ValueError(f"flag {token!r}")
+        values: list[str] = []
+        while i < len(rest) and not rest[i].startswith("-") and (kind == "many" or not values):
+            values.append(rest[i])
+            i += 1
+        if not values or (kind == "scope" and values[0] not in README_SCOPES):
+            raise ValueError(f"value of {token!r}")
+        if kind == "config" and not README_CONFIG_RE.fullmatch(values[0]):
+            raise ValueError(f"value of {token!r}")
+        if kind in ("one", "scope", "config") and len(values) != 1:
+            raise ValueError(f"value of {token!r}")
+        flags[token] = [*flags.get(token, []), *values] if kind == "config" else values
+    return positional, flags
+
+
+def flatten_flags(flags: dict[str, list[str]]) -> list[str]:
+    """Back to argv; a repeatable flag (--config) is repeated per value, not given several."""
+    return [t for f, v in flags.items() for t in ([x for val in v for x in (f, val)] if f == "--config" else (f, *v))]
+
+
+def readme_args(argv: object) -> tuple[str, list[str]]:
+    """(kind, args after `claude`) for a README command, or ValueError. The only shapes: a marketplace
+    add, an install (the runner appends --json), or `plugin <word>` for a word the CLI doesn't know
+    (run bare: its arguments are never passed on)."""
+    if not isinstance(argv, list) or not 3 <= len(argv) <= README_ARGV_MAX:
+        raise ValueError("argv shape")
+    if not all(isinstance(t, str) and 0 < len(t) <= README_TOKEN_MAX and not README_CONTROL_RE.search(t) for t in argv):
+        raise ValueError("argv token")
+    if argv[0] != "claude" or argv[1] not in ("plugin", "plugins"):
+        raise ValueError("not a claude plugin command")
+    sub = argv[2]
+    if sub not in README_SUBCOMMANDS:
+        if not README_WORD_RE.fullmatch(sub):
+            raise ValueError("subcommand")
+        return "unknown_subcommand", ["plugin", sub]
+    if sub == "marketplace":
+        if argv[3:4] != ["add"]:
+            raise ValueError("marketplace subcommand")
+        positional, flags = parse_flags(argv[4:], {"--scope": "scope", "--sparse": "many"})
+        if len(positional) != 1 or README_LOCAL_RE.match(positional[0]):
+            raise ValueError("marketplace source")
+        return "add", ["plugin", "marketplace", "add", positional[0], *flatten_flags(flags)]
+    if sub in ("install", "i"):
+        spec = {"--marketplace": "one", "--scope": "scope", "-s": "scope", "--config": "config"}
+        positional, flags = parse_flags(argv[3:], spec)
+        if len(positional) != 1 or any(README_LOCAL_RE.match(v) for v in flags.get("--marketplace", [])):
+            raise ValueError("install target")
+        return "install", ["plugin", "install", positional[0], *flatten_flags(flags)]
+    raise ValueError("subcommand")
+
+
+def install_names_unadded_marketplace(args: list[str], names: set[str]) -> bool:
+    """`install p@m` with no --marketplace, where no add of the README produced marketplace `m`."""
+    target = args[2]
+    return "--marketplace" not in args and "@" in target and target.rsplit("@", 1)[1] not in names
+
+
+def marketplace_names(listed_stdout: str) -> set[str]:
+    try:
+        records = json.loads(listed_stdout)
+    except json.JSONDecodeError:
+        return set()
+    return {r["name"] for r in records if isinstance(r, dict) and isinstance(r.get("name"), str)} if isinstance(records, list) else set()
+
+
+def readme_attempt(claude: str, adds: list[list[str]], command: dict) -> tuple[str, str | None]:
+    """One README line in a fresh HOME, after the README's own earlier `marketplace add` lines
+    (`adds`, validated args). (outcome, message); not_checked says nothing about the README."""
+    root = Path(tempfile.mkdtemp(prefix="cliv-"))
+    try:
+        env = isolated_env(root)
+
+        def run(args: list[str]) -> tuple[int, str]:
+            done = run_cli([claude, *args], env, root)
+            return done.returncode, (done.stdout + done.stderr)
+
+        kind, args = readme_args(command["argv"])
+        if kind != command["kind"]:
+            return "not_checked", "runner: the line is not the kind the site planned"
+        if kind == "unknown_subcommand":
+            code, output = run(args)
+            if code == 0:
+                return "ok", normalize(output, root) or None
+            return ("unknown_command" if UNKNOWN_COMMAND_RE.search(output) else "error"), normalize(output, root)
+        if kind == "add":
+            code, output = run(args)
+            if code == 0:
+                return "ok", None
+            return refusal_or_note(output, "add_refused", root)
+        for earlier in adds:
+            code, output = run(earlier)
+            if code != 0:
+                outcome, message = refusal_or_note(output, "add_refused", root)
+                return ("error" if outcome == "error" else "not_checked"), f"an earlier marketplace add of the README failed: {message}"
+        added = run(["plugin", "marketplace", "list", "--json"]) if adds else (0, "[]")
+        code, output = run([*args, "--json"])
+        result = parse_install(output)
+        outcome = classify_install(result, output)
+        message = (result or {}).get("message") or output
+        if outcome == "installed":
+            return "ok", None
+        if outcome == "command_source_refused":
+            return "not_checked", "the entry installs by running a command on this machine"
+        if outcome == "install_refused":
+            if install_names_unadded_marketplace(args, marketplace_names(added[1])):
+                return "not_checked", "the line names a marketplace the README never adds"
+            return refusal_or_note(message, "install_refused", root)
+        return "error", normalize(message, root)
+    except subprocess.TimeoutExpired:
+        return "error", f"timed out after {TIMEOUT_S} s"
+    except ValueError as error:
+        return "not_checked", f"runner refused the command: {error}"
+    except Exception as error:  # noqa: BLE001 — one bad line must not take the batch with it
+        return "error", f"runner: {type(error).__name__}: {error}"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def refusal_or_note(output: str, refusal: str, root: Path) -> tuple[str, str]:
+    """A failure of the README's own command: the refusal, unless it needs the network to settle
+    (error) or a credential the runner lacks (not_checked)."""
+    message = normalize(output, root)
+    if TRANSIENT_RE.search(output):
+        return "error", message
+    if AUTH_RE.search(output):
+        return "not_checked", f"needs a credential this check does not have: {message}"
+    return refusal, message
+
+
+def readme_check_one(claude: str, item: dict, command: dict, adds: list[list[str]]) -> dict:
+    """A refusal is what owners get alerted on, so it must repeat in a fresh HOME (as check_one)."""
+    outcome, message = readme_attempt(claude, adds, command)
+    if outcome in README_REFUSALS:
+        again, other = readme_attempt(claude, adds, command)
+        if again != outcome:
+            message = f"flaky: attempts disagreed: {outcome} then {again}\n1: {message or ''}\n2: {other or ''}"
+            outcome = "error"
+    if message and len(message) > MESSAGE_MAX:
+        message = message[: MESSAGE_MAX - 1] + "…"
+    return {
+        "pluginId": item["pluginId"],
+        "os": "linux",
+        "checkKey": item["checkKey"],
+        "line": command["line"],
+        "outcome": outcome,
+        "message": message,
+        "checkedAt": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+
+
+def check_readme(plan_data: dict, concurrency: int, out: Path) -> list[dict]:
+    """Runs every planned README line (Linux job only); `out` is rewritten as results land."""
+    claude = shutil.which("claude")
+    if not claude:
+        raise SystemExit("claude is not on PATH")
+    jobs: list[tuple[dict, dict, list[list[str]]]] = []
+    for item in plan_data.get("readme", []):
+        adds: list[list[str]] = []
+        for command in item["commands"]:
+            jobs.append((item, command, list(adds)))
+            try:
+                kind, args = readme_args(command["argv"])
+            except ValueError:
+                continue
+            if kind == "add" and args not in adds:
+                adds.append(args)
+    results: list[dict] = []
+    out.write_text("[]")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = [pool.submit(readme_check_one, claude, *job) for job in jobs]
+        for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
+            results.append(future.result())
+            if i % 10 == 0 or i == len(futures):
+                out.write_text(json.dumps(results))
+    counts: dict[str, int] = {}
+    for r in results:
+        counts[r["outcome"]] = counts.get(r["outcome"], 0) + 1
+    print(f"readme: {len(results)} lines checked {json.dumps(counts, sort_keys=True)}", file=sys.stderr)
+    return results
+
+
+def accept_readme_results(plan_data: dict, results: object) -> tuple[list[dict], dict[str, int]]:
+    """The README results the Linux job may report: only (pluginId, checkKey, line) the plan asked
+    for, one per plugin and line (duplicates all dropped), rebuilt from known fields."""
+    dropped: dict[str, int] = {}
+
+    def drop(reason: str, n: int = 1) -> None:
+        dropped[reason] = dropped.get(reason, 0) + n
+
+    if not isinstance(results, list):
+        return [], {"not a list": 1}
+    planned = {(i["pluginId"], i["checkKey"], c["line"]) for i in plan_data.get("readme", []) for c in i["commands"]}
+    kept: dict[tuple, dict] = {}
+    duplicated: set[tuple] = set()
+    for r in results:
+        if not isinstance(r, dict):
+            drop("not an object")
+            continue
+        key = (r.get("pluginId"), r.get("checkKey"), r.get("line"))
+        if not all(isinstance(part, str) for part in key):
+            drop("bad id, key or line")
+            continue
+        checked_at = iso_or_none(r.get("checkedAt")) if isinstance(r.get("checkedAt"), str) else None
+        message = r.get("message")
+        if key not in planned:
+            drop("not planned")
+        elif r.get("outcome") not in README_OUTCOMES or not (message is None or isinstance(message, str)) or checked_at is None:
+            drop("malformed")
+        elif key in kept or key in duplicated:
+            duplicated.add(key)
+            drop("duplicate", 1 + (kept.pop(key, None) is not None))
+        else:
+            kept[key] = {
+                "pluginId": key[0],
+                "os": "linux",
+                "checkKey": key[1],
+                "line": key[2],
+                "outcome": r["outcome"],
+                "message": message[:MESSAGE_MAX] if message else None,
+                "checkedAt": checked_at,
+            }
+    return list(kept.values()), dropped
+
+
 # ---------------------------------------------------------------- report
 
 
@@ -438,6 +734,14 @@ def report(
             except ValueError:
                 results_by_os[os_name] = None  # counted as "not a list"
     results, dropped = accept_results(plan_data, results_by_os)
+    readme_path = results_dir / "results-linux" / "readme-linux.json"
+    readme_results: list[dict] = []
+    if readme_path.is_file():
+        try:
+            readme_results, readme_dropped = accept_readme_results(plan_data, json.loads(readme_path.read_text(encoding="utf-8")))
+        except ValueError:
+            readme_dropped = {"not a list": 1}
+        dropped.update({f"readme: {k}": v for k, v in readme_dropped.items()})
     body = {
         "runId": run_id,
         "runUrl": run_url,
@@ -446,6 +750,7 @@ def report(
         "runStartedAt": iso_or_none(run_started_at),
         "requestedAt": iso_or_none(requested_at),
         "results": results,
+        "readmeResults": readme_results,
     }
     return body, dropped
 
@@ -466,6 +771,7 @@ def main() -> None:
     c.add_argument("--os", choices=OSES, required=True)
     c.add_argument("--concurrency", type=int, default=8)
     c.add_argument("--out", type=Path, required=True)
+    c.add_argument("--readme-out", type=Path, default=None, help="Linux: where the README line results go")
     r = sub.add_parser("report")
     r.add_argument("--results-dir", type=Path, required=True)
     r.add_argument("--plan", type=Path, required=True)
@@ -483,10 +789,13 @@ def main() -> None:
         slugs = {s.strip() for s in args.slugs.split(",") if s.strip()} or None
         data = plan(targets, args.cli_version, args.force, slugs, args.mode, args.max)
         args.out.write_text(json.dumps(data))
-        oses = [o for o in OSES if data["work"][o]]
-        print(json.dumps({"os": oses, "counts": {o: len(data["work"][o]) for o in OSES}}))
+        oses = [o for o in OSES if data["work"][o] or (o == "linux" and data["readme"])]
+        print(json.dumps({"os": oses, "counts": {o: len(data["work"][o]) for o in OSES}, "readme": len(data["readme"])}))
     elif args.step == "check":
-        check(json.loads(args.plan.read_text()), args.os, args.concurrency, args.out)
+        plan_data = json.loads(args.plan.read_text())
+        check(plan_data, args.os, args.concurrency, args.out)
+        if args.os == "linux" and args.readme_out:
+            check_readme(plan_data, args.concurrency, args.readme_out)
     else:
         body, dropped = report(
             args.results_dir,

@@ -356,5 +356,271 @@ class ReportTest(unittest.TestCase):
         self.assertEqual((accepted, dropped), ([], {"not a list": 1}))
 
 
+def cmd(line, kind=None):
+    """A README command the way the site plans it (claudepluginhub readme-commands.ts)."""
+    argv = line.split()
+    kind = kind or ("add" if argv[2:4] == ["marketplace", "add"] else "install" if argv[2] in ("install", "i") else "unknown_subcommand")
+    return {"line": line, "kind": kind, "argv": argv}
+
+
+def done(code=0, out="", err=""):
+    return subprocess.CompletedProcess([], code, out, err)
+
+
+UNKNOWN_ADD = "error: unknown command 'add'\n"
+NOT_FOUND = (
+    '{"command":"install","outcome":"failed","plugin":"p@m","scope":"user","message":"Plugin \\"p\\" not found in '
+    'marketplace \\"m\\".","failureCode":"not_found"}'
+)
+
+
+class ReadmeArgsTest(unittest.TestCase):
+    def test_accepts_the_three_shapes(self):
+        self.assertEqual(
+            verify.readme_args(cmd("claude plugin marketplace add acme/tools --scope project --sparse a b")["argv"]),
+            ("add", ["plugin", "marketplace", "add", "acme/tools", "--scope", "project", "--sparse", "a", "b"]),
+        )
+        self.assertEqual(
+            verify.readme_args(cmd("claude plugins i p@m -s user --config k=v")["argv"]),
+            ("install", ["plugin", "install", "p@m", "-s", "user", "--config", "k=v"]),
+        )
+        self.assertEqual(
+            verify.readme_args(cmd("claude plugin install p --config a=b --config c=d")["argv"]),
+            ("install", ["plugin", "install", "p", "--config", "a=b", "--config", "c=d"]),
+        )
+        self.assertEqual(verify.readme_args(cmd("claude plugin add /path/to/x --force")["argv"]), ("unknown_subcommand", ["plugin", "add"]))
+
+    def test_refuses_everything_else(self):
+        for line in (
+            "claude plugin install p@m -y",
+            "claude plugin install p@m --yes",
+            "claude plugin install p@m --accept-command",
+            "claude plugin install p@m --registry r",
+            "claude plugin install p@m --scope bogus",
+            "claude plugin install p@m --scope",
+            "claude plugin install p@m --scope user --scope user",
+            "claude plugin install p@m --config a=b;c",
+            "claude plugin install p@m --marketplace ./local",
+            "claude plugin install a b",
+            "claude plugin marketplace add",
+            "claude plugin marketplace add ./x",
+            "claude plugin marketplace add ../x",
+            "claude plugin marketplace add /x",
+            "claude plugin marketplace add ~/x",
+            "claude plugin marketplace add C:\\x",
+            "claude plugin marketplace add file:///etc",
+            "claude plugin marketplace add git@gitlab.com:a/b.git",
+            "claude plugin marketplace add a/b --claudeai",
+            "claude plugin marketplace add a/b --json",
+            "claude plugin marketplace remove a",
+            "claude plugin marketplace update",
+            "claude plugin uninstall p@m",
+            "claude plugin list",
+            "claude plugin",
+            "claude plugin -p hi",
+            "claude plugin ad$d x",
+            "claude mcp list",
+            "claude -p hi",
+            "bash plugin add x",
+        ):
+            with self.assertRaises(ValueError, msg=line):
+                verify.readme_args(line.split())
+        for argv in (None, "claude plugin add x", ["claude", "plugin", 3], ["claude", "plugin", "add\nx"], ["claude", "plugin", "x" * 301]):
+            with self.assertRaises(ValueError, msg=argv):
+                verify.readme_args(argv)
+
+    def test_the_site_cannot_widen_the_cli_allowlist(self):
+        verify.cli_argv("claude", ["plugin", "marketplace", "list", "--json"])
+        with self.assertRaises(ValueError):
+            verify.cli_argv("claude", ["plugin", "marketplace", "remove", "x"])
+
+
+class ReadmePlanTest(unittest.TestCase):
+    def target(self, readme):
+        return {"pluginId": "p1", "slug": "a", "addArg": "x", "installArg": "a@m", "checkKey": "k1", "last": {}, "readme": readme}
+
+    def readme(self, last=None):
+        return {"checkKey": "r1", "sourceRef": "abc", "commands": [cmd("claude plugin add /x")], "last": last}
+
+    def test_plans_a_new_key_or_cli_version_or_error(self):
+        ok = {"cliVersion": "2.1.310", "checkKey": "r1", "outcome": "ok"}
+        planned = lambda last, mode="full": len(verify.plan([self.target(self.readme(last))], "2.1.310", mode=mode)["readme"])
+        self.assertEqual(planned(None), 1)
+        self.assertEqual(planned({**ok, "checkKey": "r0"}), 1)
+        self.assertEqual(planned(ok), 0)
+        self.assertEqual(planned({**ok, "cliVersion": "2.1.309"}), 1)
+        self.assertEqual(planned({**ok, "outcome": "error"}), 1)
+        self.assertEqual(planned({**ok, "cliVersion": "2.1.309"}, "keys"), 0)
+        self.assertEqual(planned({**ok, "outcome": "error"}, "keys"), 0)
+
+    def test_plan_carries_only_what_the_runner_needs_and_is_capped(self):
+        targets = [{**self.target(self.readme()), "pluginId": str(i), "slug": f"s{i}"} for i in range(3)]
+        planned = verify.plan(targets, "2.1.310", max_per_os=2)["readme"]
+        self.assertEqual([p["slug"] for p in planned], ["s0", "s1"])
+        self.assertEqual(set(planned[0]), {"pluginId", "slug", "checkKey", "commands"})
+        self.assertEqual(set(planned[0]["commands"][0]), {"line", "kind", "argv"})
+
+    def test_a_target_without_a_readme_plans_nothing(self):
+        self.assertEqual(verify.plan([{**self.target(None)}], "2.1.310")["readme"], [])
+        self.assertEqual(verify.plan([{k: v for k, v in self.target(None).items() if k != "readme"}], "2.1.310")["readme"], [])
+
+
+class ReadmeAttemptTest(unittest.TestCase):
+    def attempt(self, command, adds=(), replies=None):
+        """Runs readme_attempt with the CLI faked: `replies` maps the args' 2nd-3rd words to a result."""
+        calls = []
+
+        def fake(argv, env, root):
+            calls.append(argv[1:])
+            for needle, reply in (replies or {}).items():
+                if needle in " ".join(argv[1:]):
+                    return reply
+            return done()
+
+        with mock.patch.object(verify, "run_cli", fake):
+            return verify.readme_attempt("claude", [list(a) for a in adds], command), calls
+
+    def test_unknown_subcommand_is_run_bare(self):
+        result, calls = self.attempt(cmd("claude plugin add /path/to/x"), replies={"plugin add": done(1, "", UNKNOWN_ADD)})
+        self.assertEqual(result[0], "unknown_command")
+        self.assertEqual(calls, [["plugin", "add"]])
+
+    def test_a_word_the_cli_knows_now_is_ok_and_other_failures_are_errors(self):
+        self.assertEqual(self.attempt(cmd("claude plugin add x"))[0][0], "ok")
+        self.assertEqual(self.attempt(cmd("claude plugin add x"), replies={"plugin add": done(1, "", "boom")})[0][0], "error")
+
+    def test_add_line(self):
+        self.assertEqual(self.attempt(cmd("claude plugin marketplace add a/b"))[0], ("ok", None))
+        refused = {"marketplace add": done(1, "", "Invalid marketplace schema")}
+        self.assertEqual(self.attempt(cmd("claude plugin marketplace add a/b"), replies=refused)[0][0], "add_refused")
+        net = {"marketplace add": done(1, "", "Could not resolve host: github.com")}
+        self.assertEqual(self.attempt(cmd("claude plugin marketplace add a/b"), replies=net)[0][0], "error")
+        auth = {"marketplace add": done(1, "", "fatal: could not read Username for 'https://github.com'")}
+        self.assertEqual(self.attempt(cmd("claude plugin marketplace add a/b"), replies=auth)[0][0], "not_checked")
+
+    def test_install_runs_the_earlier_adds_first_then_install_json(self):
+        add = ["plugin", "marketplace", "add", "a/b"]
+        result, calls = self.attempt(cmd("claude plugin install p@m"), adds=[add], replies={"install": done(0, OK)})
+        self.assertEqual(result, ("ok", None))
+        self.assertEqual(calls, [add, ["plugin", "marketplace", "list", "--json"], ["plugin", "install", "p@m", "--json"]])
+
+    def test_install_refused_only_when_the_readme_added_that_marketplace(self):
+        add = ["plugin", "marketplace", "add", "a/b"]
+        listed = done(0, '[{"name":"m","source":"github"}]')
+        replies = {"marketplace list": listed, "install": done(1, NOT_FOUND)}
+        self.assertEqual(self.attempt(cmd("claude plugin install p@m"), adds=[add], replies=replies)[0][0], "install_refused")
+        other = {"marketplace list": done(0, '[{"name":"zzz"}]'), "install": done(1, NOT_FOUND)}
+        result = self.attempt(cmd("claude plugin install p@m"), adds=[add], replies=other)[0]
+        self.assertEqual(result[0], "not_checked")
+
+    def test_a_failed_earlier_add_says_nothing_about_the_install(self):
+        add = ["plugin", "marketplace", "add", "a/b"]
+        result, calls = self.attempt(cmd("claude plugin install p@m"), adds=[add], replies={"marketplace add": done(1, "", "Invalid marketplace schema")})
+        self.assertEqual(result[0], "not_checked")
+        self.assertEqual(calls, [add])
+        net = {"marketplace add": done(1, "", "Could not resolve host")}
+        self.assertEqual(self.attempt(cmd("claude plugin install p@m"), adds=[add], replies=net)[0][0], "error")
+
+    def test_install_outcomes(self):
+        add = ["plugin", "marketplace", "add", "a/b"]
+        listed = {"marketplace list": done(0, '[{"name":"m"}]')}
+        for out, expected in ((COMMAND_SOURCE, "not_checked"), (CLONE_NETWORK, "error"), (REFUSED, "install_refused")):
+            result = self.attempt(cmd("claude plugin install p@m"), adds=[add], replies={**listed, "install": done(1, out)})[0]
+            self.assertEqual(result[0], expected, out)
+
+    def test_a_line_the_runner_will_not_run_is_not_checked_and_runs_nothing(self):
+        bad = {"line": "claude plugin install p@m -y", "kind": "install", "argv": ["claude", "plugin", "install", "p@m", "-y"]}
+        result, calls = self.attempt(bad)
+        self.assertEqual(result[0], "not_checked")
+        self.assertEqual(calls, [])
+        # The site's kind must match what the runner sees.
+        result, calls = self.attempt({**cmd("claude plugin install p@m"), "kind": "add"})
+        self.assertEqual((result[0], calls), ("not_checked", []))
+
+    def test_timeout_is_an_error(self):
+        def slow(argv, env, root):
+            raise subprocess.TimeoutExpired(argv, 1)
+
+        with mock.patch.object(verify, "run_cli", slow):
+            self.assertEqual(verify.readme_attempt("claude", [], cmd("claude plugin marketplace add a/b"))[0], "error")
+
+
+class ReadmeRetryTest(unittest.TestCase):
+    item = {"pluginId": "p1", "checkKey": "r1"}
+
+    def run_with(self, outcomes):
+        seq = iter(outcomes)
+        with mock.patch.object(verify, "readme_attempt", lambda *a: next(seq)):
+            return verify.readme_check_one("claude", self.item, cmd("claude plugin add x"), [])
+
+    def test_a_refusal_must_repeat(self):
+        self.assertEqual(self.run_with([("unknown_command", "m1"), ("unknown_command", "m2")])["outcome"], "unknown_command")
+        self.assertEqual(self.run_with([("unknown_command", "m1"), ("unknown_command", "m2")])["message"], "m1")
+
+    def test_disagreement_is_an_error(self):
+        r = self.run_with([("install_refused", "m1"), ("ok", None)])
+        self.assertEqual(r["outcome"], "error")
+        self.assertTrue(r["message"].startswith("flaky: attempts disagreed: install_refused then ok"))
+
+    def test_ok_error_and_not_checked_run_once(self):
+        for outcome in ("ok", "error", "not_checked"):
+            self.assertEqual(self.run_with([(outcome, None)])["outcome"], outcome)
+
+
+class AcceptReadmeTest(unittest.TestCase):
+    plan_data = {"readme": [{"pluginId": "p1", "slug": "a", "checkKey": "r1", "commands": [cmd("claude plugin add x"), cmd("claude plugin install p@m")]}]}
+
+    def result(self, **over):
+        return {"pluginId": "p1", "os": "linux", "checkKey": "r1", "line": "claude plugin add x", "outcome": "unknown_command",
+                "message": "error: unknown command 'add'", "checkedAt": "2026-10-25T10:00:00Z", **over}
+
+    def test_keeps_a_planned_line_and_rebuilds_it(self):
+        accepted, dropped = verify.accept_readme_results(self.plan_data, [self.result(extra="x", os="windows")])
+        self.assertEqual(dropped, {})
+        self.assertEqual(accepted, [{**self.result(), "os": "linux"}])
+
+    def test_drops_what_the_plan_did_not_ask_for(self):
+        accepted, dropped = verify.accept_readme_results(
+            self.plan_data,
+            [
+                self.result(pluginId="p2"),
+                self.result(checkKey="old"),
+                self.result(line="claude plugin add y"),
+                self.result(outcome="installed"),
+                self.result(checkedAt="yesterday"),
+                self.result(message=["x"]),
+                self.result(pluginId=["p1"]),
+                "junk",
+            ],
+        )
+        self.assertEqual(accepted, [])
+        self.assertEqual(dropped, {"not planned": 3, "malformed": 3, "bad id, key or line": 1, "not an object": 1})
+
+    def test_a_repeated_line_is_dropped_whole(self):
+        other = self.result(line="claude plugin install p@m", outcome="ok", message=None)
+        accepted, dropped = verify.accept_readme_results(self.plan_data, [self.result(), other, self.result(outcome="ok")])
+        self.assertEqual([r["line"] for r in accepted], ["claude plugin install p@m"])
+        self.assertEqual(dropped, {"duplicate": 2})
+
+    def test_not_a_list(self):
+        self.assertEqual(verify.accept_readme_results(self.plan_data, {"a": 1}), ([], {"not a list": 1}))
+
+    def test_report_carries_the_linux_file_only(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            for os_name in ("linux", "macos"):
+                (Path(d) / f"results-{os_name}").mkdir()
+            (Path(d) / "results-linux" / "readme-linux.json").write_text(json.dumps([self.result()]))
+            (Path(d) / "results-macos" / "readme-macos.json").write_text(json.dumps([self.result()]))
+            body, dropped = verify.report(Path(d), {"work": {}, **self.plan_data}, 1, "u", "2.1.310")
+            self.assertEqual([r["line"] for r in body["readmeResults"]], ["claude plugin add x"])
+            self.assertEqual(dropped, {})
+            # A file that is not valid JSON is counted, not fatal.
+            (Path(d) / "results-linux" / "readme-linux.json").write_text("{")
+            body, dropped = verify.report(Path(d), {"work": {}, **self.plan_data}, 1, "u", "2.1.310")
+            self.assertEqual((body["readmeResults"], dropped), ([], {"readme: not a list": 1}))
+
+
 if __name__ == "__main__":
     unittest.main()

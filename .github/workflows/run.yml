@@ -128,12 +128,15 @@ jobs:
           echo "core.symlinks=$(git config --get core.symlinks || echo unset) core.longpaths=$(git config --get core.longpaths || echo unset) core.ignorecase=$(git config --get core.ignorecase || echo unset)"
           d=$(mktemp -d); touch "$d/a" "$d/A"; echo "case-sensitive filesystem: $([ "$(ls "$d" | wc -l)" -eq 2 ] && echo yes || echo no)"
       - name: Install every planned plugin
-        run: ${{ matrix.py }} verify.py check --plan plan.json --os ${{ matrix.os }} --out results-${{ matrix.os }}.json
+        run: ${{ matrix.py }} verify.py check --plan plan.json --os ${{ matrix.os }} --out results-${{ matrix.os }}.json --readme-out readme-${{ matrix.os }}.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: results-${{ matrix.os }}
-          path: results-${{ matrix.os }}.json
+          # readme-linux.json: the README's `claude plugin …` lines (Linux only; absent elsewhere).
+          path: |
+            results-${{ matrix.os }}.json
+            readme-${{ matrix.os }}.json
           retention-days: 30
 
   report:
@@ -186,7 +189,8 @@ jobs:
         run: |
           set -euo pipefail
           echo "$PLAN_SHA256  plan/plan.json" | sha256sum -c --quiet || { echo "::error::plan artifact differs from what the plan job wrote"; exit 1; }
-          # Only (plugin, OS, key) the plan asked for, one per plugin and OS; the rest is dropped and counted.
+          # Only (plugin, OS, key) the plan asked for, one per plugin and OS (README lines: per plugin and
+          # line); the rest is dropped and counted.
           python3 verify.py report --results-dir results --plan plan/plan.json --run-id "$GITHUB_RUN_ID" --run-url "$RUN_URL" --cli-version "$CLI" \
             --lane "$LANE" --run-started-at="$STARTED_AT" --requested-at="$REQUESTED_AT" --out report.json | tee -a "$GITHUB_STEP_SUMMARY"
           python3 -c 'import json,collections; r=json.load(open("report.json"))["results"]; print(collections.Counter((x["os"],x["outcome"]) for x in r))' >> "$GITHUB_STEP_SUMMARY"
