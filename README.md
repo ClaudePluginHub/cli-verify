@@ -15,6 +15,19 @@ itself has confirmed the refusal.
   the commit Claude Code recorded in `installed_plugins.json` (null when it records none). The
   load split follows `plugin list --json` `errorDetails[].type` (claudepluginhub cli-oracle c25:
   `generic-error` means nothing loads).
+- **README commands (Linux only):** a plugin's README may tell people to run `claude plugin …`
+  lines; the site extracts the checkable ones into each target's `readme` (claudepluginhub
+  `readme-commands.ts`) and the plan carries them as `readme`. Each line runs in its own fresh
+  `HOME`: a `marketplace add` line alone, an `install` line after the README's earlier `marketplace
+  add` lines (then `install … --json`), and a `claude plugin <word>` the CLI has no subcommand for
+  bare (its arguments are never passed on). The runner re-validates every argv (`readme_args`: only
+  those three shapes, no `-y`/`--yes`/`--accept-command`/`--registry`/`--claudeai`, no local path,
+  `file:` or ssh source, never a shell) and reports `not_checked` for a line it refuses. Outcomes:
+  `ok`, `add_refused`, `install_refused`, `unknown_command` (each repeated once in a fresh `HOME`,
+  like the install check), `error` (network, timeout, or attempts that disagree), `not_checked`
+  (an earlier add failed, the install names a marketplace the README never adds, the entry runs a
+  command, or the clone needs a credential). Results go in `readmeResults` of the report, one per
+  plugin and line, only for lines the plan asked for.
 - **When:** two lanes run the same jobs (`.github/workflows/run.yml`), each in its own concurrency
   group so neither waits on the other:
   - **Full** (`verify.yml`, group `cli-verify`): hourly, and by hand with `slugs` or `force`. A
@@ -30,7 +43,7 @@ itself has confirmed the refusal.
   `HOME` and `CLAUDE_CONFIG_DIR`. The same outcome stands, with the first attempt's message; a
   different outcome is reported as `error` with a message starting `flaky: attempts disagreed: `, so
   no owner alert rests on one attempt. Network failures (`TRANSIENT_RE`) are `error` as before.
-- **Report body:** `{runId, runUrl, cliVersion, lane, runStartedAt, requestedAt, results}`. `lane`
+- **Report body:** `{runId, runUrl, cliVersion, lane, runStartedAt, requestedAt, results, readmeResults}`. `lane`
   is `"full"` or `"fast"`, `runStartedAt` is when the plan job started (`…Z`), `requestedAt` is the
   fast lane's `requested_at` normalized to UTC `…Z`, or `null` (full lane, or missing/unreadable).
 - **Isolation:** the check jobs hold no secrets, no write permissions and no caches. Only the report
