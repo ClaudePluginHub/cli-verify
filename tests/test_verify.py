@@ -384,6 +384,10 @@ class ReadmeArgsTest(unittest.TestCase):
             verify.readme_args(cmd("claude plugins i p@m -s user --config k=v")["argv"]),
             ("install", ["plugin", "install", "p@m", "-s", "user", "--config", "k=v"]),
         )
+        self.assertEqual(
+            verify.readme_args(cmd("claude plugin install p --config a=b --config c=d")["argv"]),
+            ("install", ["plugin", "install", "p", "--config", "a=b", "--config", "c=d"]),
+        )
         self.assertEqual(verify.readme_args(cmd("claude plugin add /path/to/x --force")["argv"]), ("unknown_subcommand", ["plugin", "add"]))
 
     def test_refuses_everything_else(self):

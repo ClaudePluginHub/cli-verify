@@ -431,7 +431,7 @@ def parse_flags(rest: list[str], spec: dict[str, str]) -> tuple[list[str], dict[
             positional.append(token)
             continue
         kind = spec.get(token)
-        if kind is None or token in flags:
+        if kind is None or (token in flags and kind != "config"):
             raise ValueError(f"flag {token!r}")
         values: list[str] = []
         while i < len(rest) and not rest[i].startswith("-") and (kind == "many" or not values):
@@ -443,8 +443,13 @@ def parse_flags(rest: list[str], spec: dict[str, str]) -> tuple[list[str], dict[
             raise ValueError(f"value of {token!r}")
         if kind in ("one", "scope", "config") and len(values) != 1:
             raise ValueError(f"value of {token!r}")
-        flags[token] = values
+        flags[token] = [*flags.get(token, []), *values] if kind == "config" else values
     return positional, flags
+
+
+def flatten_flags(flags: dict[str, list[str]]) -> list[str]:
+    """Back to argv; a repeatable flag (--config) is repeated per value, not given several."""
+    return [t for f, v in flags.items() for t in ([x for val in v for x in (f, val)] if f == "--config" else (f, *v))]
 
 
 def readme_args(argv: object) -> tuple[str, list[str]]:
@@ -468,13 +473,13 @@ def readme_args(argv: object) -> tuple[str, list[str]]:
         positional, flags = parse_flags(argv[4:], {"--scope": "scope", "--sparse": "many"})
         if len(positional) != 1 or README_LOCAL_RE.match(positional[0]):
             raise ValueError("marketplace source")
-        return "add", ["plugin", "marketplace", "add", positional[0], *[t for f, v in flags.items() for t in (f, *v)]]
+        return "add", ["plugin", "marketplace", "add", positional[0], *flatten_flags(flags)]
     if sub in ("install", "i"):
         spec = {"--marketplace": "one", "--scope": "scope", "-s": "scope", "--config": "config"}
         positional, flags = parse_flags(argv[3:], spec)
         if len(positional) != 1 or any(README_LOCAL_RE.match(v) for v in flags.get("--marketplace", [])):
             raise ValueError("install target")
-        return "install", ["plugin", "install", positional[0], *[t for f, v in flags.items() for t in (f, *v)]]
+        return "install", ["plugin", "install", positional[0], *flatten_flags(flags)]
     raise ValueError("subcommand")
 
 
