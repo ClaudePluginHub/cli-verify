@@ -177,6 +177,27 @@ class CheckOneTest(unittest.TestCase):
         self.assertEqual(result["outcome"], "error")
         self.assertIn("refusing to run claude", result["message"])
 
+    def test_timeout_keeps_command_and_bounded_byte_output_as_an_error(self):
+        target = {"pluginId": "1", "slug": "a", "addArg": "acme/tools", "installArg": "a@m", "checkKey": "k1"}
+        command = ["claude", "plugin", "marketplace", "add", "acme/tools"]
+        timeout = subprocess.TimeoutExpired(command, 120, output=b"old output\n" + b"x" * 3000,
+                                            stderr=b"\ncheckout failed: filename too long\xff")
+        with mock.patch.object(verify, "run_cli", side_effect=timeout):
+            result = verify.check_one("claude", target, "windows")
+        self.assertEqual(result["outcome"], "error")
+        self.assertIn("timed out after 120 s: plugin marketplace add acme/tools", result["message"])
+        self.assertIn("checkout failed: filename too long", result["message"])
+        self.assertNotIn("old output", result["message"])
+        self.assertLessEqual(len(result["message"]), verify.MESSAGE_MAX)
+
+    def test_timeout_without_partial_output_is_still_an_error(self):
+        target = {"pluginId": "1", "slug": "a", "addArg": "acme/tools", "installArg": "a@m", "checkKey": "k1"}
+        timeout = subprocess.TimeoutExpired(["claude", "plugin", "list", "--json"], 120)
+        with mock.patch.object(verify, "run_cli", side_effect=timeout):
+            result = verify.check_attempt("claude", target, "windows")
+        self.assertEqual(result["outcome"], "error")
+        self.assertEqual(result["message"], "timed out after 120 s: plugin list --json")
+
 
 class RetryTest(unittest.TestCase):
     """check_one with check_attempt stubbed: each call returns the next scripted result."""
@@ -228,6 +249,15 @@ class RetryTest(unittest.TestCase):
 
 
 class EnvTest(unittest.TestCase):
+    def test_windows_isolated_git_config_enables_long_path_checkouts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.object(verify.os, "name", "nt"):
+                env = verify.isolated_env(root)
+            configured = subprocess.run(["git", "config", "--global", "--get", "core.longpaths"],
+                                        env=env, capture_output=True, text=True, check=True)
+            self.assertEqual(configured.stdout.strip(), "true")
+
     def test_strips_secrets_and_isolates_config(self):
         import os
         import tempfile

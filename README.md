@@ -44,6 +44,11 @@ itself has confirmed the refusal.
   `HOME` and `CLAUDE_CONFIG_DIR`. The same outcome stands, with the first attempt's message; a
   different outcome is reported as `error` with a message starting `flaky: attempts disagreed: `, so
   no owner alert rests on one attempt. Network failures (`TRANSIENT_RE`) are `error` as before.
+  An install-check command that exceeds 120 seconds stays `error`; its message keeps the command
+  and a bounded tail of partial output, after the process tree is killed.
+- **Windows:** its isolated Git config enables long paths, and both workflow lanes use two
+  workers instead of eight to avoid checkout timeouts. Linux/macOS keep eight workers. See the
+  [Windows diagnostic evidence](docs/windows-verification.md); the 120-second timeout is unchanged.
 - **Report body:** `{runId, runUrl, cliVersion, lane, runStartedAt, requestedAt, results, readmeResults}`. `lane`
   is `"full"` or `"fast"`, `runStartedAt` is when the plan job started (`…Z`), `requestedAt` is the
   fast lane's `requested_at` normalized to UTC `…Z`, or `null` (full lane, or missing/unreadable).

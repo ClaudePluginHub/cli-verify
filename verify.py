@@ -136,9 +136,14 @@ def isolated_env(root: Path) -> dict[str, str]:
     home.mkdir(parents=True, exist_ok=True)
     gitconfig = home / ".gitconfig"
     # Runners have no SSH key; public repos clone anonymously over HTTPS.
-    gitconfig.write_text(
+    config = (
         '[url "https://github.com/"]\n\tinsteadOf = git@github.com:\n\tinsteadOf = ssh://git@github.com/\n'
     )
+    # Deep marketplace paths fail checkout under Windows' default Git path limit.
+    # This stays inside the throwaway config; see docs/windows-verification.md.
+    if os.name == "nt":
+        config += '[core]\n\tlongpaths = true\n'
+    gitconfig.write_text(config)
     env = {k: v for k, v in os.environ.items() if not SECRET_ENV_RE.search(k)}
     env.update(
         HOME=str(home),
@@ -329,8 +334,15 @@ def check_attempt(claude: str, target: dict, os_name: str) -> dict:
             "installedRef": installed_ref(root, target["installArg"]),
         }
         return done(load_outcome(listed.stdout, target["installArg"]), "\n".join(errors) or None, **extra)
-    except subprocess.TimeoutExpired:
-        return done("error", f"timed out after {TIMEOUT_S} s")
+    except subprocess.TimeoutExpired as error:
+        # run_cli already killed the process tree. communicate() may attach bytes in text mode;
+        # keep a bounded tail, and let done() normalize/cap the report as usual.
+        output = []
+        for part in (error.stdout, error.stderr):
+            part = part[-1500:] if part else ""
+            output.append(part.decode("utf-8", errors="replace") if isinstance(part, bytes) else part or "")
+        command = " ".join(error.cmd[1:])
+        return done("error", f"timed out after {TIMEOUT_S} s: {command}\n{''.join(output)[-1500:]}")
     except Exception as error:  # noqa: BLE001 — one bad target must not take the OS's batch with it
         return done("error", f"runner: {type(error).__name__}: {error}")
     finally:
