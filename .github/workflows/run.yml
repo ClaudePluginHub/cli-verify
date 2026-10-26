@@ -11,7 +11,7 @@ on:
   workflow_call:
     inputs:
       lane:
-        description: full (new key, new Claude Code version or last error) or fast (new key only)
+        description: full (new key, CLI version or unresolved result) or fast (new key only)
         type: string
         required: true
       slugs:

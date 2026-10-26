@@ -3,7 +3,8 @@ name: Verify with Claude Code
 # Full lane. Installs ClaudePluginHub's owned and top plugins with the real Claude Code CLI on Linux,
 # macOS and Windows, and reports what it did to claudepluginhub.com. Hourly; a plugin is re-checked
 # when its commit, its install route or the Claude Code version changed, or its last result was an
-# error (see verify.py plan). The jobs live in run.yml; verify-fast.yml is the fast lane.
+# error or unclassified load_errors (see verify.py plan). The jobs live in run.yml;
+# verify-fast.yml is the fast lane.
 
 on:
   schedule:

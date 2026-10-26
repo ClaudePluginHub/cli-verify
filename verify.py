@@ -61,12 +61,12 @@ SECRET_ENV_RE = re.compile(r"TOKEN|SECRET|PASSWORD|CREDENTIAL|_KEY$|^ACTIONS_|^G
 
 
 def needs_check(target: dict, os_name: str, cli_version: str, mode: str = "full") -> bool:
-    """`full`: a new check key, a new Claude Code version or a last result of `error`. `keys` (the
-    fast lane): a new check key only; versions and errors stay the hourly full run's job."""
+    """`full`: a new key, CLI version, or unresolved result (`error` / `load_errors`). `keys`
+    (the fast lane): a new check key only; versions and unresolved results stay the full run's job."""
     last = (target.get("last") or {}).get(os_name)
     if last is None or last.get("checkKey") != target["checkKey"]:
         return True
-    return mode == "full" and (last.get("cliVersion") != cli_version or last.get("outcome") == "error")
+    return mode == "full" and (last.get("cliVersion") != cli_version or last.get("outcome") in {"error", "load_errors"})
 
 
 def readme_needs_check(readme: dict, cli_version: str, mode: str = "full") -> bool:
@@ -214,7 +214,8 @@ def load_errors(list_stdout: str, install_arg: str) -> list[str] | None:
 
 
 # `errorDetails[].type` values that leave the rest of the plugin loaded (claudepluginhub c25, c32).
-# `generic-error` is the one where Claude Code loads none of it (`plugin details` says "not found").
+# Whole-plugin blockers: `generic-error` (c25) and `dependency-unsatisfied` (session probe,
+# docs/dependency-loading.md). `plugin details` can list files even when the session loads none.
 PARTIAL_LOAD_TYPES = {"hook-load-failed", "path-not-found", "component-load-failed"}
 
 
@@ -226,7 +227,7 @@ def load_outcome(list_stdout: str, install_arg: str) -> str:
         return "installed"
     details = record.get("errorDetails")
     types = {d.get("type") for d in details if isinstance(d, dict)} if isinstance(details, list) else set()
-    if "generic-error" in types:
+    if types & {"generic-error", "dependency-unsatisfied"}:
         return "load_refused"
     return "load_warnings" if types and types <= PARTIAL_LOAD_TYPES else "load_errors"
 

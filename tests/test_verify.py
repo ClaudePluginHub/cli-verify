@@ -114,6 +114,24 @@ class ClassifyTest(unittest.TestCase):
         ):
             self.assertEqual(verify.load_outcome(json.dumps([record]), "h@m"), outcome, record)
 
+    def test_missing_dependency_blocks_loading_even_with_other_errors(self):
+        # Claude Code 2.1.310 session probe: docs/dependency-loading.md.
+        for other_types in ([], ["hook-load-failed"], ["something-new"], ["generic-error"]):
+            with self.subTest(other_types=other_types):
+                record = {
+                    "id": "p@m",
+                    "errors": ['Dependency "document-skills@anthropic-agent-skills" is not installed'],
+                    "errorDetails": [{"type": t} for t in ["dependency-unsatisfied", *other_types]],
+                }
+                self.assertEqual(verify.load_outcome(json.dumps([record]), "p@m"), "load_refused")
+
+    def test_unknown_errors_stay_unclassified_without_a_known_blocker(self):
+        for types in (["something-new"], ["hook-load-failed", "something-new"]):
+            with self.subTest(types=types):
+                record = {"id": "p@m", "errors": ["unplaced error"],
+                          "errorDetails": [{"type": t} for t in types]}
+                self.assertEqual(verify.load_outcome(json.dumps([record]), "p@m"), "load_errors")
+
     def test_installed_ref_from_the_cli_record(self):
         sha = "c494ecef09253c615807669e7b28fb9723bc3c61"
         with tempfile.TemporaryDirectory() as tmp:
@@ -201,6 +219,13 @@ class RetryTest(unittest.TestCase):
         result, _ = self.run_with(("add_refused", "bad name"), ("error", "Could not resolve host"))
         self.assertEqual(result["outcome"], "error")
 
+    def test_dependency_refusal_must_repeat_in_a_fresh_attempt(self):
+        message = 'Dependency "document-skills@anthropic-agent-skills" is not installed'
+        result, calls = self.run_with(("load_refused", message), ("load_refused", message))
+        self.assertEqual((result["outcome"], result["message"], calls), ("load_refused", message, 2))
+        result, calls = self.run_with(("load_refused", message), ("installed", None))
+        self.assertEqual((result["outcome"], calls), ("error", 2))
+
 
 class EnvTest(unittest.TestCase):
     def test_strips_secrets_and_isolates_config(self):
@@ -235,6 +260,17 @@ class PlanTest(unittest.TestCase):
         work = verify.plan([{**self.target, "last": last}, {**self.target, "pluginId": "2", "slug": "b", "last": {}}], "2.1.302")["work"]
         self.assertEqual([t["slug"] for t in work["linux"]], ["a", "b"])
         self.assertEqual([t["slug"] for t in work["macos"]], ["b"])
+
+    def test_full_lane_retries_unresolved_results_but_keys_lane_does_not(self):
+        for outcome in ("error", "load_errors", "installed", "add_refused", "install_refused", "load_refused", "load_warnings"):
+            with self.subTest(outcome=outcome):
+                last = {o: {"cliVersion": "2.1.310", "checkKey": "k1", "outcome": outcome} for o in verify.OSES}
+                target = {**self.target, "last": last}
+                full = verify.plan([target], "2.1.310")["work"]
+                keys = verify.plan([target], "2.1.310", mode="keys")["work"]
+                expected = 1 if outcome in {"error", "load_errors"} else 0
+                self.assertEqual({o: len(w) for o, w in full.items()}, dict.fromkeys(verify.OSES, expected))
+                self.assertEqual({o: len(w) for o, w in keys.items()}, dict.fromkeys(verify.OSES, 0))
 
     def test_force_and_slugs(self):
         last = {o: {"cliVersion": "2.1.302", "checkKey": "k1", "outcome": "installed"} for o in verify.OSES}
