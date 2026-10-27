@@ -114,16 +114,18 @@ class ClassifyTest(unittest.TestCase):
         ):
             self.assertEqual(verify.load_outcome(json.dumps([record]), "h@m"), outcome, record)
 
-    def test_missing_dependency_blocks_loading_even_with_other_errors(self):
-        # Claude Code 2.1.310 session probe: docs/dependency-loading.md.
-        for other_types in ([], ["hook-load-failed"], ["something-new"], ["generic-error"]):
+    def test_missing_dependency_stays_unclassified(self):
+        # It loads once the dependency's marketplace is added (docs/dependency-loading.md), so it is
+        # not a refusal of the plugin; generic-error alongside it still is.
+        for other_types, outcome in (([], "load_errors"), (["hook-load-failed"], "load_errors"),
+                                     (["generic-error"], "load_refused")):
             with self.subTest(other_types=other_types):
                 record = {
                     "id": "p@m",
                     "errors": ['Dependency "document-skills@anthropic-agent-skills" is not installed'],
                     "errorDetails": [{"type": t} for t in ["dependency-unsatisfied", *other_types]],
                 }
-                self.assertEqual(verify.load_outcome(json.dumps([record]), "p@m"), "load_refused")
+                self.assertEqual(verify.load_outcome(json.dumps([record]), "p@m"), outcome)
 
     def test_unknown_errors_stay_unclassified_without_a_known_blocker(self):
         for types in (["something-new"], ["hook-load-failed", "something-new"]):
@@ -239,13 +241,6 @@ class RetryTest(unittest.TestCase):
         # A transient failure on the second attempt is not confirmation.
         result, _ = self.run_with(("add_refused", "bad name"), ("error", "Could not resolve host"))
         self.assertEqual(result["outcome"], "error")
-
-    def test_dependency_refusal_must_repeat_in_a_fresh_attempt(self):
-        message = 'Dependency "document-skills@anthropic-agent-skills" is not installed'
-        result, calls = self.run_with(("load_refused", message), ("load_refused", message))
-        self.assertEqual((result["outcome"], result["message"], calls), ("load_refused", message, 2))
-        result, calls = self.run_with(("load_refused", message), ("installed", None))
-        self.assertEqual((result["outcome"], calls), ("error", 2))
 
 
 class EnvTest(unittest.TestCase):
