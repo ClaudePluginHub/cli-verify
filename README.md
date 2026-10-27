@@ -14,7 +14,8 @@ itself has confirmed the refusal.
   error type not yet placed, or a refusal at add or install), the CLI's message, and `installedRef`,
   the commit Claude Code recorded in `installed_plugins.json` (null when it records none). The
   load split follows `plugin list --json` `errorDetails[].type` (claudepluginhub cli-oracle c25:
-  `generic-error` means nothing loads).
+  `generic-error` means nothing loads; `dependency-unsatisfied` also blocks session loading,
+  confirmed by the [Claude Code 2.1.310 session probe](docs/dependency-loading.md)).
 - **README commands (Linux only):** a plugin's README may tell people to run `claude plugin …`
   lines; the site extracts the checkable ones into each target's `readme` (claudepluginhub
   `readme-commands.ts`) and the plan carries them as `readme`. Each line runs in its own fresh
@@ -32,7 +33,7 @@ itself has confirmed the refusal.
   group so neither waits on the other:
   - **Full** (`verify.yml`, group `cli-verify`): hourly, and by hand with `slugs` or `force`. A
     plugin is checked again when its commit, its marketplace entry, its install route or the Claude
-    Code version changes, or its last result was `error`.
+    Code version changes, or its last result was `error` or unclassified `load_errors`.
   - **Fast** (`verify-fast.yml`, group `cli-verify-fast`): dispatched by claudepluginhub.com, input
     `requested_at` (ISO 8601, optional). Checks only plugins whose check key differs from their
     stored result on that OS (or that have none), at most 50 per OS (`verify.py plan --mode keys
@@ -43,6 +44,11 @@ itself has confirmed the refusal.
   `HOME` and `CLAUDE_CONFIG_DIR`. The same outcome stands, with the first attempt's message; a
   different outcome is reported as `error` with a message starting `flaky: attempts disagreed: `, so
   no owner alert rests on one attempt. Network failures (`TRANSIENT_RE`) are `error` as before.
+  An install-check command that exceeds 120 seconds stays `error`; its message keeps the command
+  and a bounded tail of partial output, after the process tree is killed.
+- **Windows:** its isolated Git config enables long paths, and both workflow lanes use two
+  workers instead of eight to avoid checkout timeouts. Linux/macOS keep eight workers. See the
+  [Windows diagnostic evidence](docs/windows-verification.md); the 120-second timeout is unchanged.
 - **Report body:** `{runId, runUrl, cliVersion, lane, runStartedAt, requestedAt, results, readmeResults}`. `lane`
   is `"full"` or `"fast"`, `runStartedAt` is when the plan job started (`…Z`), `requestedAt` is the
   fast lane's `requested_at` normalized to UTC `…Z`, or `null` (full lane, or missing/unreadable).

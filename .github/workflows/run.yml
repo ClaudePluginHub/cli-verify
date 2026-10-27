@@ -11,7 +11,7 @@ on:
   workflow_call:
     inputs:
       lane:
-        description: full (new key, new Claude Code version or last error) or fast (new key only)
+        description: full (new key, CLI version or unresolved result) or fast (new key only)
         type: string
         required: true
       slugs:
@@ -128,7 +128,11 @@ jobs:
           echo "core.symlinks=$(git config --get core.symlinks || echo unset) core.longpaths=$(git config --get core.longpaths || echo unset) core.ignorecase=$(git config --get core.ignorecase || echo unset)"
           d=$(mktemp -d); touch "$d/a" "$d/A"; echo "case-sensitive filesystem: $([ "$(ls "$d" | wc -l)" -eq 2 ] && echo yes || echo no)"
       - name: Install every planned plugin
-        run: ${{ matrix.py }} verify.py check --plan plan.json --os ${{ matrix.os }} --out results-${{ matrix.os }}.json --readme-out readme-${{ matrix.os }}.json
+        # Eight concurrent Windows checkouts exceed the 120 s deadline (docs/windows-verification.md).
+        run: >-
+          ${{ matrix.py }} verify.py check --plan plan.json --os ${{ matrix.os }}
+          --concurrency ${{ matrix.os == 'windows' && '2' || '8' }}
+          --out results-${{ matrix.os }}.json --readme-out readme-${{ matrix.os }}.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
