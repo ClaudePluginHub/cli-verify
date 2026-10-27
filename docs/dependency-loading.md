@@ -29,12 +29,24 @@ Neither installation success nor that inventory proves loading. A local marketpl
 otherwise equivalent dependency declaration instead.
 
 The same missing-dependency message affected 15 plugins on each OS in
-[run 40175427695](https://github.com/ClaudePluginHub/cli-verify/actions/runs/40175427695).
-`dependency-unsatisfied` therefore maps to `load_refused`, including when other error types
-accompany it. Unknown types without a known whole-plugin blocker remain `load_errors` and
-are retried by the full lane. Refusals still require two matching attempts in separate fresh configs.
+[run 40175427695](https://github.com/ClaudePluginHub/cli-verify/actions/runs/40175427695), all
+from `codearranger/claude-legal`. Its marketplace allowlists `anthropic-agent-skills`
+(`allowCrossMarketplaceDependenciesOn`), as the Claude Code docs require for a dependency from
+another marketplace.
 
-After merging a classifier fix, select the affected slugs in `verify.yml` to obtain current
-results on all three OSes through normal ingestion. Full-lane reports refresh coverage gaps.
-Closing an unknown gap is not a plugin recovery: missing dependencies remain real refusals,
-and any Linux disagreement with the site's rules remains visible.
+## The plugins' real setup, 2026-10-27
+
+Claude Code 2.1.311, the verifier's commands and isolation (fresh `HOME` / `CLAUDE_CONFIG_DIR`, no
+session), installing `az-court-docs@claude-legal`:
+
+| Marketplaces added first | `plugin install --json` | `plugin list --json` |
+| --- | --- | --- |
+| `codearranger/claude-legal` only (what the verifier runs) | `ok`, warning: `dependency "document-skills@anthropic-agent-skills" was not installed (no marketplace you have added lists it)` | `dependency-unsatisfied` |
+| `anthropics/skills`, then `codearranger/claude-legal` | `ok`, `(+ 2 dependencies: claude-legal-federal-laws, document-skills)` | no errors on any of the three |
+
+So a missing dependency is a fact about the install steps, not a refusal of the plugin: it loads
+once the dependency's marketplace is added. `dependency-unsatisfied` therefore stays `load_errors`
+(no owner alert, retried by the full lane), and `generic-error` beside it is still `load_refused`.
+The synthetic probe above could not show this, because a local marketplace named
+`anthropic-agent-skills` is reserved. The fix belongs in the install steps: add the dependency's
+marketplace first, and have the verifier run the same steps.

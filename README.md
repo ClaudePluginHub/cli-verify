@@ -14,8 +14,8 @@ itself has confirmed the refusal.
   error type not yet placed, or a refusal at add or install), the CLI's message, and `installedRef`,
   the commit Claude Code recorded in `installed_plugins.json` (null when it records none). The
   load split follows `plugin list --json` `errorDetails[].type` (claudepluginhub cli-oracle c25:
-  `generic-error` means nothing loads; `dependency-unsatisfied` also blocks session loading,
-  confirmed by the [Claude Code 2.1.310 session probe](docs/dependency-loading.md)).
+  `generic-error` means nothing loads). `dependency-unsatisfied` stays `load_errors`: it loads once
+  the dependency's marketplace is added ([dependency loading](docs/dependency-loading.md)).
 - **README commands (Linux only):** a plugin's README may tell people to run `claude plugin …`
   lines; the site extracts the checkable ones into each target's `readme` (claudepluginhub
   `readme-commands.ts`) and the plan carries them as `readme`. Each line runs in its own fresh

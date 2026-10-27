@@ -219,8 +219,8 @@ def load_errors(list_stdout: str, install_arg: str) -> list[str] | None:
 
 
 # `errorDetails[].type` values that leave the rest of the plugin loaded (claudepluginhub c25, c32).
-# Whole-plugin blockers: `generic-error` (c25) and `dependency-unsatisfied` (session probe,
-# docs/dependency-loading.md). `plugin details` can list files even when the session loads none.
+# `generic-error` (c25) is the one where Claude Code loads none of it. `dependency-unsatisfied` stays
+# unplaced: whether it loads depends on what else the user added (docs/dependency-loading.md).
 PARTIAL_LOAD_TYPES = {"hook-load-failed", "path-not-found", "component-load-failed"}
 
 
@@ -232,7 +232,7 @@ def load_outcome(list_stdout: str, install_arg: str) -> str:
         return "installed"
     details = record.get("errorDetails")
     types = {d.get("type") for d in details if isinstance(d, dict)} if isinstance(details, list) else set()
-    if types & {"generic-error", "dependency-unsatisfied"}:
+    if "generic-error" in types:
         return "load_refused"
     return "load_warnings" if types and types <= PARTIAL_LOAD_TYPES else "load_errors"
 
