@@ -118,6 +118,7 @@ class ClassifyTest(unittest.TestCase):
         # The commands run left a dependency out: Claude Code won't load the plugin without it.
         # generic-error alongside it still means nothing in the plugin loads.
         for other_types, outcome in (([], "dependency_missing"), (["hook-load-failed"], "dependency_missing"),
+                                     (["path-not-found"], "dependency_missing"),
                                      (["generic-error"], "load_refused")):
             with self.subTest(other_types=other_types):
                 record = {
