@@ -6,11 +6,12 @@ Three steps, one per workflow job:
           targets whose check key (commit, marketplace entry, route) or CLI version changed since
           their stored result (`--mode full`), or only whose check key changed (`--mode keys`,
           the fast lane).
-  check   plan.json -> results-<os>.json: install each planned target in a throwaway HOME and
-          CLAUDE_CONFIG_DIR, 8 at a time; a result other than installed or error is checked once
-          more in a fresh one (check_one). Runs third-party code paths; the job holds no secrets.
-  report  plan.json + results-*.json -> report.json, the body POSTed to /api/cli-checks/results:
-          only the results the plan asked of each OS (accept_results).
+  check   plan.json -> results-<os>-<shard>.json: install the shard's planned targets in a throwaway
+          HOME and CLAUDE_CONFIG_DIR, 8 at a time (2 on Windows); a result other than installed or
+          error is checked once more in a fresh one (check_one). One job per OS and shard (Windows
+          splits into shards of WINDOWS_SHARD_SIZE). Runs third-party code paths; holds no secrets.
+  report  plan.json + results-<os>-<shard>.json -> report.json, the body POSTed to
+          /api/cli-checks/results: only the results the plan asked of each shard (accept_results).
 
 Only `claude plugin marketplace add <x>`, `claude plugin install <x> --json`,
 `claude plugin list --json` and `claude plugin marketplace list --json` are ever run (see cli_argv),
@@ -36,6 +37,10 @@ import time
 from pathlib import Path
 
 OSES = ("linux", "macos", "windows")
+# Targets per Windows check job. A Windows job checks 2 at a time (docs/windows-verification.md):
+# 826 targets took 116.5 of its 120 minutes (run 40598531743), and the slowest set measured ran at
+# ~0.7 min per target, so 100 stays near 70 min. Linux and macOS check 826 in ~10 min in one job.
+WINDOWS_SHARD_SIZE = 100
 TIMEOUT_S = 120
 MESSAGE_MAX = 2000
 # The CLI clones into a randomly named folder (`temp_github_1792291888483_qr227e`). Without the random
@@ -111,7 +116,18 @@ def plan(
                 work[os_name].append(
                     {k: target[k] for k in ("pluginId", "slug", "addArg", "installArg", "checkKey")}
                 )
-    return {"cliVersion": cli_version, "work": work, "readme": readmes}
+    shards = {os_name: 1 if work[os_name] else 0 for os_name in OSES}
+    shards["windows"] = -(-len(work["windows"]) // WINDOWS_SHARD_SIZE)
+    if readmes:
+        shards["linux"] = 1  # the README lines run in the Linux job
+    return {"cliVersion": cli_version, "work": work, "readme": readmes, "shards": shards}
+
+
+def shard_work(plan_data: dict, os_name: str, shard: int) -> list[dict]:
+    """Every n-th planned target from `shard` on: the plan's order clusters slow repos (one owner's
+    big marketplace), and round-robin spreads them over the shards."""
+    return plan_data["work"][os_name][shard :: plan_data["shards"][os_name]]
+
 
 
 # ---------------------------------------------------------------- check
@@ -378,13 +394,13 @@ def check_one(claude: str, target: dict, os_name: str) -> dict:
     }
 
 
-def check(plan_data: dict, os_name: str, concurrency: int, out: Path) -> list[dict]:
-    """Installs every planned target; `out` is rewritten as results land, so a job that hits its
-    time limit still uploads what it finished (the rest is planned again next run)."""
+def check(plan_data: dict, os_name: str, shard: int, concurrency: int, out: Path) -> list[dict]:
+    """Installs the shard's planned targets; `out` is rewritten as results land, so a job that hits
+    its time limit still uploads what it finished (the rest is planned again next run)."""
     claude = shutil.which("claude")
     if not claude:
         raise SystemExit("claude is not on PATH")
-    work = plan_data["work"][os_name]
+    work = shard_work(plan_data, os_name, shard)
     results: list[dict] = []
     out.write_text("[]")
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -672,22 +688,24 @@ def accept_readme_results(plan_data: dict, results: object) -> tuple[list[dict],
 # ---------------------------------------------------------------- report
 
 
-def accept_results(plan_data: dict, results_by_os: dict[str, list]) -> tuple[list[dict], dict[str, int]]:
-    """The results a check job may report: each OS's file only for that OS, only (pluginId,
-    checkKey) pairs the plan job planned for that OS, at most one per plugin. Anything else is
+def accept_results(
+    plan_data: dict, results_by_job: dict[tuple[str, int], list]
+) -> tuple[list[dict], dict[str, int]]:
+    """The results a check job may report: each (OS, shard) file only for that OS, only (pluginId,
+    checkKey) pairs the plan job planned for that shard, at most one per plugin. Anything else is
     dropped and counted by reason.
 
     A check job runs third-party code paths and the check keys are public, so its results file is
     untrusted: without this, a job could claim any plugin's result on any OS. A job can still lie
-    about the plugins planned for its own OS (see README, Isolation)."""
+    about the plugins planned for its own shard (see README, Isolation)."""
     accepted: list[dict] = []
     dropped: dict[str, int] = {}
 
     def drop(reason: str, n: int = 1) -> None:
         dropped[reason] = dropped.get(reason, 0) + n
 
-    for os_name, results in results_by_os.items():
-        planned = {(t["pluginId"], t["checkKey"]) for t in plan_data["work"].get(os_name, [])}
+    for (os_name, shard), results in results_by_job.items():
+        planned = {(t["pluginId"], t["checkKey"]) for t in shard_work(plan_data, os_name, shard)}
         if not isinstance(results, list):
             drop("not a list")
             continue
@@ -736,18 +754,20 @@ def report(
     run_started_at: str | None = None,
     requested_at: str | None = None,
 ) -> tuple[dict, dict[str, int]]:
-    """`results_dir` holds one folder per check artifact (`results-<os>/results-<os>.json`); the
-    OS comes from the artifact name the workflow gave it, never from the file's content."""
-    results_by_os: dict[str, list] = {}
+    """`results_dir` holds one folder per check artifact (`results-<os>-<shard>/results-<os>-<shard>.json`);
+    the OS and shard come from the artifact name the workflow gave it, never from the file's content."""
+    results_by_job: dict[tuple[str, int], list] = {}
     for os_name in OSES:
-        path = results_dir / f"results-{os_name}" / f"results-{os_name}.json"
-        if path.is_file():
-            try:
-                results_by_os[os_name] = json.loads(path.read_text(encoding="utf-8"))
-            except ValueError:
-                results_by_os[os_name] = None  # counted as "not a list"
-    results, dropped = accept_results(plan_data, results_by_os)
-    readme_path = results_dir / "results-linux" / "readme-linux.json"
+        for shard in range(plan_data["shards"][os_name]):
+            name = f"results-{os_name}-{shard}"
+            path = results_dir / name / f"{name}.json"
+            if path.is_file():
+                try:
+                    results_by_job[(os_name, shard)] = json.loads(path.read_text(encoding="utf-8"))
+                except ValueError:
+                    results_by_job[(os_name, shard)] = None  # counted as "not a list"
+    results, dropped = accept_results(plan_data, results_by_job)
+    readme_path = results_dir / "results-linux-0" / "readme-linux.json"
     readme_results: list[dict] = []
     if readme_path.is_file():
         try:
@@ -782,6 +802,7 @@ def main() -> None:
     c = sub.add_parser("check")
     c.add_argument("--plan", type=Path, required=True)
     c.add_argument("--os", choices=OSES, required=True)
+    c.add_argument("--shard", type=int, required=True, help="which of the plan's shards for this OS")
     c.add_argument("--concurrency", type=int, default=8)
     c.add_argument("--out", type=Path, required=True)
     c.add_argument("--readme-out", type=Path, default=None, help="Linux: where the README line results go")
@@ -802,11 +823,10 @@ def main() -> None:
         slugs = {s.strip() for s in args.slugs.split(",") if s.strip()} or None
         data = plan(targets, args.cli_version, args.force, slugs, args.mode, args.max)
         args.out.write_text(json.dumps(data))
-        oses = [o for o in OSES if data["work"][o] or (o == "linux" and data["readme"])]
-        print(json.dumps({"os": oses, "counts": {o: len(data["work"][o]) for o in OSES}, "readme": len(data["readme"])}))
+        print(json.dumps({"shards": data["shards"], "counts": {o: len(data["work"][o]) for o in OSES}, "readme": len(data["readme"])}))
     elif args.step == "check":
         plan_data = json.loads(args.plan.read_text())
-        check(plan_data, args.os, args.concurrency, args.out)
+        check(plan_data, args.os, args.shard, args.concurrency, args.out)
         if args.os == "linux" and args.readme_out:
             check_readme(plan_data, args.concurrency, args.readme_out)
     else:

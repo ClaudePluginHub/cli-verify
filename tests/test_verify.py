@@ -323,6 +323,29 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(len(work["windows"]), 2)
 
 
+class ShardTest(unittest.TestCase):
+    def targets(self, n):
+        return [{"pluginId": str(i), "slug": f"s{i}", "addArg": "a", "installArg": "i", "checkKey": "k"} for i in range(n)]
+
+    def test_windows_splits_into_shards_of_the_shard_size(self):
+        size = verify.WINDOWS_SHARD_SIZE
+        for n, windows in ((0, 0), (1, 1), (size, 1), (size + 1, 2), (826, 9)):
+            shards = verify.plan(self.targets(n), "2.1.311", force=True)["shards"]
+            self.assertEqual(shards, {"linux": min(n, 1), "macos": min(n, 1), "windows": windows}, n)
+
+    def test_readme_lines_alone_plan_the_linux_job(self):
+        target = {**self.targets(1)[0], "readme": {"checkKey": "r", "commands": [], "last": None},
+                  "last": {o: {"checkKey": "k", "cliVersion": "2.1.311", "outcome": "installed"} for o in verify.OSES}}
+        self.assertEqual(verify.plan([target], "2.1.311")["shards"], {"linux": 1, "macos": 0, "windows": 0})
+
+    def test_shards_cover_every_target_once_round_robin(self):
+        plan = verify.plan(self.targets(826), "2.1.311", force=True)
+        slices = [verify.shard_work(plan, "windows", i) for i in range(plan["shards"]["windows"])]
+        self.assertEqual(sorted(t["pluginId"] for s in slices for t in s), sorted(str(i) for i in range(826)))
+        self.assertEqual([t["pluginId"] for t in slices[1][:2]], ["1", "10"])
+        self.assertLessEqual(max(map(len, slices)) - min(map(len, slices)), 1)
+
+
 class ReportTest(unittest.TestCase):
     """A check job's results file is untrusted: only what the plan asked of that OS is reported."""
 
@@ -333,18 +356,20 @@ class ReportTest(unittest.TestCase):
             "macos": [],
             "windows": [{"pluginId": "p1", "checkKey": "k1"}],
         },
+        "shards": {"linux": 1, "macos": 0, "windows": 1},
     }
 
     def result(self, plugin_id, os_name, key, outcome="installed"):
         return {"pluginId": plugin_id, "os": os_name, "checkKey": key, "outcome": outcome}
 
-    def build(self, files):
+    def build(self, files, plan=None):
         with tempfile.TemporaryDirectory() as d:
-            for os_name, content in files.items():
-                folder = Path(d) / f"results-{os_name}"
+            for name, content in files.items():
+                name = name if "-" in name else f"{name}-0"
+                folder = Path(d) / f"results-{name}"
                 folder.mkdir()
-                (folder / f"results-{os_name}.json").write_text(json.dumps(content))
-            body, dropped = verify.report(Path(d), self.plan, 1, "https://github.com/o/r/actions/runs/1", "2.1.302")
+                (folder / f"results-{name}.json").write_text(json.dumps(content))
+            body, dropped = verify.report(Path(d), plan or self.plan, 1, "https://github.com/o/r/actions/runs/1", "2.1.302")
         return [(r["pluginId"], r["os"]) for r in body["results"]], dropped
 
     def test_keeps_a_planned_result(self):
@@ -363,12 +388,12 @@ class ReportTest(unittest.TestCase):
                     self.result("p2", "linux", "k2"),
                     self.result("p2", "linux", "k2", "install_refused"),  # duplicate: both go
                 ],
-                "macos": [self.result("p1", "macos", "k1")],  # nothing planned on macOS
+                "macos": [self.result("p1", "macos", "k1")],  # nothing planned on macOS: never read
                 "windows": [self.result("p1", "windows", "k1")],
             }
         )
         self.assertEqual(accepted, [("p1", "linux"), ("p1", "windows")])
-        self.assertEqual(dropped, {"not planned": 3, "wrong os": 1, "duplicate": 2})
+        self.assertEqual(dropped, {"not planned": 2, "wrong os": 1, "duplicate": 2})
 
     def test_drops_non_string_ids_and_keys(self):
         accepted, dropped = self.build(
@@ -411,6 +436,20 @@ class ReportTest(unittest.TestCase):
             )
             body = json.loads(out.read_text())
             self.assertEqual((body["requestedAt"], body["runStartedAt"]), (None, "2026-10-24T10:00:05Z"))
+
+    def test_each_windows_shard_reports_only_its_own_targets(self):
+        targets = [{"pluginId": f"p{i}", "checkKey": f"k{i}"} for i in range(4)]
+        plan = {"work": {"linux": [], "macos": [], "windows": targets}, "shards": {"linux": 0, "macos": 0, "windows": 2}}
+        accepted, dropped = self.build(
+            {
+                "windows-0": [self.result("p0", "windows", "k0"), self.result("p1", "windows", "k1")],  # p1 is shard 1's
+                "windows-1": [self.result("p1", "windows", "k1"), self.result("p3", "windows", "k3")],
+                "windows-2": [self.result("p2", "windows", "k2")],  # no such shard: never read
+            },
+            plan,
+        )
+        self.assertEqual(sorted(accepted), [("p0", "windows"), ("p1", "windows"), ("p3", "windows")])
+        self.assertEqual(dropped, {"not planned": 1})
 
     def test_drops_a_file_that_is_not_a_list(self):
         accepted, dropped = self.build({"linux": {"pluginId": "p1"}})
@@ -671,15 +710,15 @@ class AcceptReadmeTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             for os_name in ("linux", "macos"):
-                (Path(d) / f"results-{os_name}").mkdir()
-            (Path(d) / "results-linux" / "readme-linux.json").write_text(json.dumps([self.result()]))
-            (Path(d) / "results-macos" / "readme-macos.json").write_text(json.dumps([self.result()]))
-            body, dropped = verify.report(Path(d), {"work": {}, **self.plan_data}, 1, "u", "2.1.310")
+                (Path(d) / f"results-{os_name}-0").mkdir()
+            (Path(d) / "results-linux-0" / "readme-linux.json").write_text(json.dumps([self.result()]))
+            (Path(d) / "results-macos-0" / "readme-macos.json").write_text(json.dumps([self.result()]))
+            body, dropped = verify.report(Path(d), {"work": {}, "shards": {"linux": 1, "macos": 1, "windows": 0}, **self.plan_data}, 1, "u", "2.1.310")
             self.assertEqual([r["line"] for r in body["readmeResults"]], ["claude plugin add x"])
             self.assertEqual(dropped, {})
             # A file that is not valid JSON is counted, not fatal.
-            (Path(d) / "results-linux" / "readme-linux.json").write_text("{")
-            body, dropped = verify.report(Path(d), {"work": {}, **self.plan_data}, 1, "u", "2.1.310")
+            (Path(d) / "results-linux-0" / "readme-linux.json").write_text("{")
+            body, dropped = verify.report(Path(d), {"work": {}, "shards": {"linux": 1, "macos": 1, "windows": 0}, **self.plan_data}, 1, "u", "2.1.310")
             self.assertEqual((body["readmeResults"], dropped), ([], {"readme: not a list": 1}))
 
 
