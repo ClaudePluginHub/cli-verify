@@ -45,8 +45,12 @@ session), installing `az-court-docs@claude-legal`:
 | `anthropics/skills`, then `codearranger/claude-legal` | `ok`, `(+ 2 dependencies: claude-legal-federal-laws, document-skills)` | no errors on any of the three |
 
 So a missing dependency is a fact about the install steps, not a refusal of the plugin: it loads
-once the dependency's marketplace is added. `dependency-unsatisfied` therefore stays `load_errors`
-(no owner alert, retried by the full lane), and `generic-error` beside it is still `load_refused`.
-The synthetic probe above could not show this, because a local marketplace named
-`anthropic-agent-skills` is reserved. The fix belongs in the install steps: add the dependency's
-marketplace first, and have the verifier run the same steps.
+once the dependency's marketplace is added. The synthetic probe above could not show this, because
+a local marketplace named `anthropic-agent-skills` is reserved. The fix belongs in the install
+steps: add the dependency's marketplace first, and have the verifier run the same steps.
+
+Since 2026-10-28 it does (`deps`, the steps the plugin page shows). `dependency-unsatisfied` after
+those steps is therefore `dependency_missing`: the page's commands leave the dependency out (its
+author states no source we can use), and Claude Code won't load the plugin without it. The site
+treats it like a load refusal for alerts, and its owner workspace names the README line that fixes
+it. `generic-error` beside it is still `load_refused`.

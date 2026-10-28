@@ -241,14 +241,16 @@ def load_errors(list_stdout: str, install_arg: str) -> list[str] | None:
 
 
 # `errorDetails[].type` values that leave the rest of the plugin loaded (claudepluginhub c25, c32).
-# `generic-error` (c25) is the one where Claude Code loads none of it. `dependency-unsatisfied` stays
-# unplaced: whether it loads depends on what else the user added (docs/dependency-loading.md).
+# `generic-error` (c25) is the one where Claude Code loads none of it. `dependency-unsatisfied` is its
+# own outcome: the commands we ran (the page's, with its dependency steps) left a dependency out, and
+# Claude Code won't load the plugin without it (docs/dependency-loading.md).
 PARTIAL_LOAD_TYPES = {"hook-load-failed", "path-not-found", "component-load-failed"}
 
 
 def load_outcome(list_stdout: str, install_arg: str) -> str:
-    """installed, load_refused (loads none of it), load_warnings (loads it, drops a part) or
-    load_errors (errors of a type c25 hasn't placed: the site treats it as unknown)."""
+    """installed, load_refused (loads none of it), dependency_missing (won't load without a dependency
+    the commands didn't install), load_warnings (loads it, drops a part) or load_errors (errors of a
+    type c25 hasn't placed: the site treats it as unknown)."""
     record = list_record(list_stdout, install_arg) or {}
     if not record.get("errors"):
         return "installed"
@@ -256,6 +258,8 @@ def load_outcome(list_stdout: str, install_arg: str) -> str:
     types = {d.get("type") for d in details if isinstance(d, dict)} if isinstance(details, list) else set()
     if "generic-error" in types:
         return "load_refused"
+    if "dependency-unsatisfied" in types:
+        return "dependency_missing"
     return "load_warnings" if types and types <= PARTIAL_LOAD_TYPES else "load_errors"
 
 
