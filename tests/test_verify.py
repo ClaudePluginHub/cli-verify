@@ -80,6 +80,14 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(verify.classify_add_failure("Error: Marketplace name cannot contain spaces"), "add_refused")
         self.assertEqual(verify.classify_add_failure("fatal: unable to access: Could not resolve host"), "error")
         self.assertEqual(verify.classify_add_failure("Request failed with status code 503"), "error")
+        # Production, 2026-10-28 (Windows): our own marketplace.json answered after 10 s.
+        self.assertEqual(
+            verify.classify_add_failure(
+                "Adding marketplace…\n✘ Failed to add marketplace: Failed to download marketplace from "
+                "https://www.claudepluginhub.com/api/plugins/alittlefox-claude-bottombar/marketplace.json: timeout of 10000ms exceeded"
+            ),
+            "error",
+        )
 
     def test_load_errors_for_the_installed_plugin_only(self):
         listed = json.dumps([
