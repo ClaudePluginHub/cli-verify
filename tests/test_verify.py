@@ -201,6 +201,55 @@ class CheckOneTest(unittest.TestCase):
         self.assertEqual(result["message"], f"timed out after {verify.TIMEOUT_S} s: plugin list --json")
 
 
+class DependencyStepsTest(unittest.TestCase):
+    target = {"pluginId": "1", "slug": "a", "addArg": "acme/tools", "installArg": "a@tools", "checkKey": "k1",
+              "deps": [{"addArg": "anthropics/skills", "installArg": "pdf@anthropic-agent-skills"},
+                       {"addArg": "anthropics/skills", "installArg": "docx@anthropic-agent-skills"}]}
+
+    def run_with(self, fail=None):
+        calls = []
+
+        def run_cli(argv, env, root):
+            args = argv[1:]
+            calls.append(" ".join(args))
+            if fail and " ".join(args).startswith(fail):
+                return subprocess.CompletedProcess(argv, 1, "", "✘ not found")
+            if args[:2] == ["plugin", "install"]:
+                return subprocess.CompletedProcess(argv, 0, '{"command": "install", "outcome": "ok"}', "")
+            if args == ["plugin", "list", "--json"]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps([{"id": "a@tools", "errors": []}]), "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(verify, "run_cli", run_cli):
+            return verify.check_attempt("claude", self.target, "linux"), calls
+
+    def test_runs_the_steps_a_user_follows_in_order(self):
+        result, calls = self.run_with()
+        self.assertEqual(result["outcome"], "installed")
+        self.assertEqual(calls, [
+            "plugin marketplace add anthropics/skills",
+            "plugin marketplace add acme/tools",
+            "plugin install pdf@anthropic-agent-skills --json",
+            "plugin install docx@anthropic-agent-skills --json",
+            "plugin install a@tools --json",
+            "plugin list --json",
+        ])
+
+    def test_a_failed_dependency_step_is_an_error_not_a_refusal_of_the_plugin(self):
+        for step in ("plugin marketplace add anthropics/skills", "plugin install docx@"):
+            with self.subTest(step=step):
+                result, calls = self.run_with(fail=step)
+                self.assertEqual(result["outcome"], "error")
+                self.assertTrue(result["message"].startswith("dependency step failed: claude plugin "))
+                self.assertNotIn("plugin install a@tools --json", calls)
+
+    def test_plan_carries_the_steps(self):
+        work = verify.plan([{**self.target, "last": {}}], "2.1.312")["work"]
+        self.assertEqual(work["linux"][0]["deps"], self.target["deps"])
+        no_deps = {k: v for k, v in self.target.items() if k != "deps"}
+        self.assertEqual(verify.plan([{**no_deps, "last": {}}], "2.1.312")["work"]["linux"][0]["deps"], [])
+
+
 class RetryTest(unittest.TestCase):
     """check_one with check_attempt stubbed: each call returns the next scripted result."""
 
