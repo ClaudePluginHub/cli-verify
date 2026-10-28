@@ -49,15 +49,20 @@ itself has confirmed the refusal.
 - **Windows:** its isolated Git config enables long paths, and both workflow lanes use two
   workers instead of eight to avoid checkout timeouts. Linux/macOS keep eight workers. See the
   [Windows diagnostic evidence](docs/windows-verification.md); the 120-second timeout is unchanged.
+  With two workers a full Windows check of 826 plugins took 116.5 of the job's 120 minutes, so
+  Windows is split into parallel jobs of at most 100 plugins (`WINDOWS_SHARD_SIZE`), every n-th
+  planned plugin per job so one owner's slow repos don't land in one job. Linux and macOS run one
+  job each.
 - **Report body:** `{runId, runUrl, cliVersion, lane, runStartedAt, requestedAt, results, readmeResults}`. `lane`
   is `"full"` or `"fast"`, `runStartedAt` is when the plan job started (`…Z`), `requestedAt` is the
   fast lane's `requested_at` normalized to UTC `…Z`, or `null` (full lane, or missing/unreadable).
 - **Isolation:** the check jobs hold no secrets, no write permissions and no caches. Only the report
   job, which runs no plugin code, holds the secret that posts results to claudepluginhub.com. It
-  reports a result only if the plan job planned that plugin, check key and OS, from the artifact of
-  that OS's job, once; anything else is dropped and counted in the job summary. This is defense in
-  depth, not isolation: the plugins one OS job installs share its VM and user, so code run while
-  installing one could rewrite the results of the others on that OS (or, with the runner's token,
-  replace another job's artifact). Full isolation would take one ephemeral job per plugin.
+  reports a result only if the plan job planned that plugin, check key and OS for that check job
+  (OS and shard), from that job's own artifact, once; anything else is dropped and counted in the
+  job summary. This is defense in depth, not isolation: the plugins one check job installs share its
+  VM and user, so code run while installing one could rewrite the results of the others in that job
+  (or, with the runner's token, replace another job's artifact). Full isolation would take one
+  ephemeral job per plugin.
 
 Tests: `python3 -m unittest tests/test_verify.py`.

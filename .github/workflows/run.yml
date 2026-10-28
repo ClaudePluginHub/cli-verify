@@ -72,7 +72,8 @@ jobs:
           [[ "$cli" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::unreadable version '$cli'"; exit 1; }
           curl -fsS --retry 3 "$SITE/api/cli-checks/targets" -o targets.json
           python3 verify.py plan --targets targets.json --cli-version "$cli" --slugs "$SLUGS" $FORCE $MODE --out plan.json | tee plan-summary.json
-          matrix=$(python3 -c 'import json; s=json.load(open("plan-summary.json")); r={"linux":["ubuntu-latest","python3"],"macos":["macos-latest","python3"],"windows":["windows-latest","python"]}; print(json.dumps({"include":[{"os":o,"runner":r[o][0],"py":r[o][1]} for o in s["os"]]}, separators=(",",":")))')
+          # One check job per OS and shard (Windows: WINDOWS_SHARD_SIZE targets per job, verify.py).
+          matrix=$(python3 -c 'import json; s=json.load(open("plan-summary.json")); r={"linux":["ubuntu-latest","python3"],"macos":["macos-latest","python3"],"windows":["windows-latest","python"]}; print(json.dumps({"include":[{"os":o,"shard":i,"runner":r[o][0],"py":r[o][1]} for o,n in s["shards"].items() for i in range(n)]}, separators=(",",":")))')
           echo "cli=$cli" >> "$GITHUB_OUTPUT"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "plan-sha256=$(sha256sum plan.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
@@ -90,8 +91,9 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
-    # A new Claude Code version re-checks every target; Windows takes longest. Results are saved as
-    # they land, so a job that runs out of time still reports what it finished.
+    # A new Claude Code version re-checks every target; Windows takes longest, so it is split into
+    # shards. Results are saved as they land, so a job that runs out of time still reports what it
+    # finished.
     timeout-minutes: 120
     permissions:
       contents: read
@@ -127,19 +129,19 @@ jobs:
           git --version
           echo "core.symlinks=$(git config --get core.symlinks || echo unset) core.longpaths=$(git config --get core.longpaths || echo unset) core.ignorecase=$(git config --get core.ignorecase || echo unset)"
           d=$(mktemp -d); touch "$d/a" "$d/A"; echo "case-sensitive filesystem: $([ "$(ls "$d" | wc -l)" -eq 2 ] && echo yes || echo no)"
-      - name: Install every planned plugin
+      - name: Install this shard's planned plugins
         # Eight concurrent Windows checkouts exceed the 120 s deadline (docs/windows-verification.md).
         run: >-
-          ${{ matrix.py }} verify.py check --plan plan.json --os ${{ matrix.os }}
+          ${{ matrix.py }} verify.py check --plan plan.json --os ${{ matrix.os }} --shard ${{ matrix.shard }}
           --concurrency ${{ matrix.os == 'windows' && '2' || '8' }}
-          --out results-${{ matrix.os }}.json --readme-out readme-${{ matrix.os }}.json
+          --out results-${{ matrix.os }}-${{ matrix.shard }}.json --readme-out readme-${{ matrix.os }}.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: results-${{ matrix.os }}
+          name: results-${{ matrix.os }}-${{ matrix.shard }}
           # readme-linux.json: the README's `claude plugin …` lines (Linux only; absent elsewhere).
           path: |
-            results-${{ matrix.os }}.json
+            results-${{ matrix.os }}-${{ matrix.shard }}.json
             readme-${{ matrix.os }}.json
           retention-days: 30
 
@@ -153,6 +155,7 @@ jobs:
     environment: ingest
     permissions:
       contents: read
+      actions: read  # gh run download: this run's check artifacts
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -161,27 +164,20 @@ jobs:
         with:
           name: plan
           path: plan
-      # One download per OS, by name, into that OS's folder: a result's OS is the artifact it came in,
-      # and a check job can't drop a file into another OS's folder. (A `pattern` download extracts
-      # flat when only one artifact matches.) A job that died before uploading reports nothing.
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        if: contains(needs.plan.outputs.matrix, '"os":"linux"')
-        continue-on-error: true
-        with:
-          name: results-linux
-          path: results/results-linux
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        if: contains(needs.plan.outputs.matrix, '"os":"macos"')
-        continue-on-error: true
-        with:
-          name: results-macos
-          path: results/results-macos
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        if: contains(needs.plan.outputs.matrix, '"os":"windows"')
-        continue-on-error: true
-        with:
-          name: results-windows
-          path: results/results-windows
+      # One download per check job, by name, into that job's folder: a result's OS and shard are the
+      # artifact it came in, and a check job can't drop a file into another job's folder. (A
+      # download-artifact `pattern` extracts flat when only one artifact matches, and a name list
+      # can't follow the shard count.) A job that died before uploading reports nothing.
+      - name: Download the check results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+        run: |
+          set -euo pipefail
+          for name in $(jq -r '.include[] | "results-\(.os)-\(.shard)"' <<< "$MATRIX"); do
+            gh run download "$GITHUB_RUN_ID" -R "$GITHUB_REPOSITORY" -n "$name" -D "results/$name" \
+              || echo "::warning::no $name artifact"
+          done
       - name: Build the report
         env:
           CLI: ${{ needs.plan.outputs.cli }}
