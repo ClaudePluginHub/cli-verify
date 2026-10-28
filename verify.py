@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -41,7 +42,10 @@ OSES = ("linux", "macos", "windows")
 # 826 targets took 116.5 of its 120 minutes (run 40598531743), and the slowest set measured ran at
 # ~0.7 min per target, so 100 stays near 70 min. Linux and macOS check 826 in ~10 min in one job.
 WINDOWS_SHARD_SIZE = 100
-TIMEOUT_S = 120
+# Per command. Claude Code's own git clone timeout is 120 s (CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS,
+# default 120000, 2.1.312), on the clone alone: ours is longer, so a clone too slow for Claude Code
+# fails with its own message, not ours.
+TIMEOUT_S = 180
 MESSAGE_MAX = 2000
 # The CLI clones into a randomly named folder (`temp_github_1792291888483_qr227e`). Without the random
 # part, the same refusal reads the same on every OS and run. Paths are otherwise left as they are: a
@@ -116,6 +120,10 @@ def plan(
                 work[os_name].append(
                     {k: target[k] for k in ("pluginId", "slug", "addArg", "installArg", "checkKey")}
                 )
+    # The site lists one marketplace's plugins together (104 from alirezarezvani/claude-skills, slow to
+    # clone on Windows): in a stable pseudo-random order, the jobs don't all clone it at once.
+    for os_name in OSES:
+        work[os_name].sort(key=lambda t: hashlib.sha256(t["pluginId"].encode()).hexdigest())
     shards = {os_name: 1 if work[os_name] else 0 for os_name in OSES}
     shards["windows"] = -(-len(work["windows"]) // WINDOWS_SHARD_SIZE)
     if readmes:
@@ -124,8 +132,7 @@ def plan(
 
 
 def shard_work(plan_data: dict, os_name: str, shard: int) -> list[dict]:
-    """Every n-th planned target from `shard` on: the plan's order clusters slow repos (one owner's
-    big marketplace), and round-robin spreads them over the shards."""
+    """Every n-th planned target from `shard` on."""
     return plan_data["work"][os_name][shard :: plan_data["shards"][os_name]]
 
 
