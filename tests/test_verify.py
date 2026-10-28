@@ -338,18 +338,6 @@ class ShardTest(unittest.TestCase):
                   "last": {o: {"checkKey": "k", "cliVersion": "2.1.311", "outcome": "installed"} for o in verify.OSES}}
         self.assertEqual(verify.plan([target], "2.1.311")["shards"], {"linux": 1, "macos": 0, "windows": 0})
 
-    def test_one_marketplace_is_spread_over_the_plan(self):
-        # 104 plugins of one marketplace listed together, as the site does.
-        targets = self.targets(895)
-        for t in targets[64:168]:
-            t["addArg"] = "big/marketplace"
-        plan = verify.plan(targets, "2.1.311", force=True)
-        again = verify.plan(list(reversed(targets)), "2.1.311", force=True)
-        self.assertEqual(plan["work"], again["work"])  # the order depends on the plugins, not the listing
-        for i in range(plan["shards"]["windows"]):
-            first = verify.shard_work(plan, "windows", i)[:20]
-            self.assertLess(sum(t["addArg"] == "big/marketplace" for t in first), 10, i)
-
     def test_shards_cover_every_target_once(self):
         plan = verify.plan(self.targets(826), "2.1.311", force=True)
         slices = [verify.shard_work(plan, "windows", i) for i in range(plan["shards"]["windows"])]

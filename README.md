@@ -44,17 +44,16 @@ itself has confirmed the refusal.
   `HOME` and `CLAUDE_CONFIG_DIR`. The same outcome stands, with the first attempt's message; a
   different outcome is reported as `error` with a message starting `flaky: attempts disagreed: `, so
   no owner alert rests on one attempt. Network failures (`TRANSIENT_RE`) are `error` as before.
-  An install-check command that exceeds 180 seconds stays `error`; its message keeps the command
+  An install-check command that exceeds 300 seconds stays `error`; its message keeps the command
   and a bounded tail of partial output, after the process tree is killed. Claude Code's own clone
-  timeout is 120 seconds (`CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS`), so a clone too slow for Claude Code
-  fails with its own message first (also `error`).
+  timeout is 120 seconds per attempt (`CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS`), so a clone too slow for
+  Claude Code fails with its own message first (also `error`, never an owner alert).
 - **Windows:** its isolated Git config enables long paths, and both workflow lanes use two
   workers instead of eight to avoid checkout timeouts. Linux/macOS keep eight workers. See the
   [Windows diagnostic evidence](docs/windows-verification.md).
   With two workers a full Windows check of 826 plugins took 116.5 of the job's 120 minutes, so
-  Windows is split into parallel jobs of at most 100 plugins (`WINDOWS_SHARD_SIZE`). The plan is in
-  a stable pseudo-random order (by plugin id), so the jobs don't all clone one big marketplace at
-  the same time. Linux and macOS run one job each.
+  Windows is split into parallel jobs of at most 100 plugins (`WINDOWS_SHARD_SIZE`), every n-th
+  planned plugin per job. Linux and macOS run one job each.
 - **Report body:** `{runId, runUrl, cliVersion, lane, runStartedAt, requestedAt, results, readmeResults}`. `lane`
   is `"full"` or `"fast"`, `runStartedAt` is when the plan job started (`…Z`), `requestedAt` is the
   fast lane's `requested_at` normalized to UTC `…Z`, or `null` (full lane, or missing/unreadable).
