@@ -53,11 +53,13 @@ MESSAGE_MAX = 2000
 TEMP_NAME_RE = re.compile(r"\b(temp_[a-z]+)_\d{10,}_[a-z0-9]+\b")
 
 # A failure that says nothing about the plugin: retried next run, never reported as a refusal.
+# `timeout of 10000ms exceeded` is Claude Code's own limit on fetching a URL marketplace (claudepluginhub
+# scripts/cli-oracle c36, CLI 2.1.312): our wrapper endpoint answering slowly, not the plugin.
 # Phrases only: the text echoes repo and plugin names, so a bare word like "tls" would turn a
 # refusal of `acme/mtls-proxy` into an hourly retry.
 TRANSIENT_RE = re.compile(
     r"could not resolve host|connection (?:timed out|reset|refused)|etimedout|econnreset|eai_again"
-    r"|timed out|operation too slow|ssl (?:connect|certificate)|tls handshake|gnutls|schannel"
+    r"|timed out|timeout of \d+ms exceeded|operation too slow|ssl (?:connect|certificate)|tls handshake|gnutls|schannel"
     r"|http (?:429|5\d\d)|status code (?:429|5\d\d)|rate limit|early eof"
     r"|rpc failed|unexpected disconnect|temporary failure|network is unreachable",
     re.IGNORECASE,
