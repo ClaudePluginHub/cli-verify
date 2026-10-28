@@ -114,10 +114,11 @@ class ClassifyTest(unittest.TestCase):
         ):
             self.assertEqual(verify.load_outcome(json.dumps([record]), "h@m"), outcome, record)
 
-    def test_missing_dependency_stays_unclassified(self):
-        # It loads once the dependency's marketplace is added (docs/dependency-loading.md), so it is
-        # not a refusal of the plugin; generic-error alongside it still is.
-        for other_types, outcome in (([], "load_errors"), (["hook-load-failed"], "load_errors"),
+    def test_missing_dependency_is_its_own_outcome(self):
+        # The commands run left a dependency out: Claude Code won't load the plugin without it.
+        # generic-error alongside it still means nothing in the plugin loads.
+        for other_types, outcome in (([], "dependency_missing"), (["hook-load-failed"], "dependency_missing"),
+                                     (["path-not-found"], "dependency_missing"),
                                      (["generic-error"], "load_refused")):
             with self.subTest(other_types=other_types):
                 record = {
