@@ -187,7 +187,7 @@ class CheckOneTest(unittest.TestCase):
         with mock.patch.object(verify, "run_cli", side_effect=timeout):
             result = verify.check_one("claude", target, "windows")
         self.assertEqual(result["outcome"], "error")
-        self.assertIn("timed out after 120 s: plugin marketplace add acme/tools", result["message"])
+        self.assertIn(f"timed out after {verify.TIMEOUT_S} s: plugin marketplace add acme/tools", result["message"])
         self.assertIn("checkout failed: filename too long", result["message"])
         self.assertNotIn("old output", result["message"])
         self.assertLessEqual(len(result["message"]), verify.MESSAGE_MAX)
@@ -198,7 +198,7 @@ class CheckOneTest(unittest.TestCase):
         with mock.patch.object(verify, "run_cli", side_effect=timeout):
             result = verify.check_attempt("claude", target, "windows")
         self.assertEqual(result["outcome"], "error")
-        self.assertEqual(result["message"], "timed out after 120 s: plugin list --json")
+        self.assertEqual(result["message"], f"timed out after {verify.TIMEOUT_S} s: plugin list --json")
 
 
 class RetryTest(unittest.TestCase):
@@ -338,11 +338,22 @@ class ShardTest(unittest.TestCase):
                   "last": {o: {"checkKey": "k", "cliVersion": "2.1.311", "outcome": "installed"} for o in verify.OSES}}
         self.assertEqual(verify.plan([target], "2.1.311")["shards"], {"linux": 1, "macos": 0, "windows": 0})
 
-    def test_shards_cover_every_target_once_round_robin(self):
+    def test_one_marketplace_is_spread_over_the_plan(self):
+        # 104 plugins of one marketplace listed together, as the site does.
+        targets = self.targets(895)
+        for t in targets[64:168]:
+            t["addArg"] = "big/marketplace"
+        plan = verify.plan(targets, "2.1.311", force=True)
+        again = verify.plan(list(reversed(targets)), "2.1.311", force=True)
+        self.assertEqual(plan["work"], again["work"])  # the order depends on the plugins, not the listing
+        for i in range(plan["shards"]["windows"]):
+            first = verify.shard_work(plan, "windows", i)[:20]
+            self.assertLess(sum(t["addArg"] == "big/marketplace" for t in first), 10, i)
+
+    def test_shards_cover_every_target_once(self):
         plan = verify.plan(self.targets(826), "2.1.311", force=True)
         slices = [verify.shard_work(plan, "windows", i) for i in range(plan["shards"]["windows"])]
         self.assertEqual(sorted(t["pluginId"] for s in slices for t in s), sorted(str(i) for i in range(826)))
-        self.assertEqual([t["pluginId"] for t in slices[1][:2]], ["1", "10"])
         self.assertLessEqual(max(map(len, slices)) - min(map(len, slices)), 1)
 
 

@@ -130,7 +130,7 @@ jobs:
           echo "core.symlinks=$(git config --get core.symlinks || echo unset) core.longpaths=$(git config --get core.longpaths || echo unset) core.ignorecase=$(git config --get core.ignorecase || echo unset)"
           d=$(mktemp -d); touch "$d/a" "$d/A"; echo "case-sensitive filesystem: $([ "$(ls "$d" | wc -l)" -eq 2 ] && echo yes || echo no)"
       - name: Install this shard's planned plugins
-        # Eight concurrent Windows checkouts exceed the 120 s deadline (docs/windows-verification.md).
+        # Eight concurrent Windows checkouts exceed the command deadline (docs/windows-verification.md).
         run: >-
           ${{ matrix.py }} verify.py check --plan plan.json --os ${{ matrix.os }} --shard ${{ matrix.shard }}
           --concurrency ${{ matrix.os == 'windows' && '2' || '8' }}
