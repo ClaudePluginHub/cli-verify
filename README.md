@@ -9,6 +9,11 @@ itself has confirmed the refusal.
   and `claude plugin list --json`, each plugin in its own throwaway `HOME` and `CLAUDE_CONFIG_DIR`.
   No Claude session, no `-p`, no `claude mcp`. stdin is never a terminal, so Claude Code never runs a
   marketplace entry's `command` source.
+- **Dependencies in another marketplace:** when the site sends a target's `deps` (only from the
+  plugin author's own README, or Anthropic's `anthropics` repo for a reserved marketplace name), the
+  runner adds those marketplaces first, then the plugin's, then installs each dependency and the
+  plugin: the steps the plugin page shows. A failed dependency step is reported as `error`, never
+  as a refusal of the plugin.
 - **What it reports:** per plugin and OS, the outcome (`installed`, `load_warnings` when Claude Code
   loads the plugin but drops a part, `load_refused` when it loads none of it, `load_errors` for an
   error type not yet placed, or a refusal at add or install), the CLI's message, and `installedRef`,

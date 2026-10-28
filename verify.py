@@ -118,7 +118,10 @@ def plan(
                 continue
             if force or slugs or needs_check(target, os_name, cli_version, mode):
                 work[os_name].append(
-                    {k: target[k] for k in ("pluginId", "slug", "addArg", "installArg", "checkKey")}
+                    {
+                        **{k: target[k] for k in ("pluginId", "slug", "addArg", "installArg", "checkKey")},
+                        "deps": target.get("deps") or [],
+                    }
                 )
     shards = {os_name: 1 if work[os_name] else 0 for os_name in OSES}
     shards["windows"] = -(-len(work["windows"]) // WINDOWS_SHARD_SIZE)
@@ -331,12 +334,28 @@ def check_attempt(claude: str, target: dict, os_name: str) -> dict:
             **listed,
         }
 
+    def dependency_failed(step: str, output: str) -> dict:
+        # About the dependency, not the plugin: never a refusal of the plugin's own commands.
+        return done("error", f"dependency step failed: claude plugin {step}\n{output}")
+
     try:
         env = isolated_env(root)
+        deps = target.get("deps") or []
+        # The steps a user follows: the dependencies' marketplaces, the page's marketplace, the
+        # dependencies themselves (installed explicitly: the plugin's marketplace may not allowlist
+        # them), then the plugin. The site keys the check on these steps.
+        for add_arg in dict.fromkeys(d["addArg"] for d in deps):
+            added = run(["plugin", "marketplace", "add", add_arg])
+            if added.returncode != 0:
+                return dependency_failed(f"marketplace add {add_arg}", added.stdout + added.stderr)
         added = run(["plugin", "marketplace", "add", target["addArg"]])
         if added.returncode != 0:
             output = added.stdout + added.stderr
             return done(classify_add_failure(output), output)
+        for dep in deps:
+            installed = run(["plugin", "install", dep["installArg"], "--json"])
+            if classify_install(parse_install(installed.stdout), installed.stdout + installed.stderr) != "installed":
+                return dependency_failed(f"install {dep['installArg']}", installed.stdout + installed.stderr)
         installed = run(["plugin", "install", target["installArg"], "--json"])
         result = parse_install(installed.stdout)
         outcome = classify_install(result, installed.stdout + installed.stderr)
